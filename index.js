@@ -580,11 +580,19 @@ export function apply(ctx, rawConfig) {
   async function sweep(agent, request = {}) {
     const state = stateOf(agent)
     const explicit = Array.isArray(request.paths) ? request.paths : null
+    const requestedTopic = typeof request.topic === 'string' ? request.topic.trim() : ''
     const base = baseDirOf(agent)
     const result = { folder: join(base, folderOf(agent, state)), moved: [], skipped: [] }
     if (state.busy) {
       result.skipped.push({ path: '*', reason: '一次归拢还没结束' })
       return result
+    }
+    // Naming the folder is honoured even before any tool ran: the call that names
+    // it cannot have set the turn's "a tool ran" mark yet.
+    if (requestedTopic.length > 0 && settledFolder(state) === null) {
+      state.folder = buildFolderName(state.date, requestedTopic, opts.topicMaxChars)
+      state.frozen = true
+      result.folder = join(base, state.folder)
     }
     // A turn that ran no tool cannot have produced conversation output, so the
     // per-turn directory walk is skipped for pure-conversation turns.
@@ -592,11 +600,6 @@ export function apply(ctx, rawConfig) {
     state.busy = true
     const started = Date.now()
     try {
-      const requestedTopic = typeof request.topic === 'string' ? request.topic.trim() : ''
-      if (requestedTopic.length > 0 && settledFolder(state) === null) {
-        state.folder = buildFolderName(state.date, requestedTopic, opts.topicMaxChars)
-        state.frozen = true
-      }
       const isFirstObservation = state.baseline === null
       const baseline = await ensureBaseline(agent, state)
       if (baseline.names === null) {

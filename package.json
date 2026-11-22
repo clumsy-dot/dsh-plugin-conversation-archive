@@ -1,6 +1,6 @@
 {
   "name": "dsh-conversation-archive",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Put every conversation's output files into one <date>_<topic> folder inside the workspace.",
   "type": "module",
   "exports": {

@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Conversation output folders",
+    "title": "dsh-conversation-archive",
     "description": "Files a conversation generates go into a <date>_<topic> folder inside the working directory instead of the root.",
     "detail": "docs/DETAIL.md"
   }

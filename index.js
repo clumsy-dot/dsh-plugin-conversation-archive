@@ -50,6 +50,9 @@ const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i
 /** A conversation folder the model created for itself: a date prefix and a topic. */
 const DATED_FOLDER = /^\d{4}-\d{2}-\d{2}_./u
 
+/** Keys under which a tool call names the file it targets. */
+const PATH_KEYS = /^(?:file_?path|path|file|target|destination|output_?path|dst|src)$/iu
+
 /** Openers that carry no summarizing value once the topic is truncated. */
 const FILLER_OPENER = /^(?:请|麻烦|帮我|帮忙|给我|我想|我想要|我需要|能不能|可以|希望|做一个|写一个|搞一个|弄一个)+/u
 
@@ -199,6 +202,29 @@ function isIgnored(patterns, candidate) {
 }
 
 /**
+ * Collect the file paths a tool call names, at any depth of its arguments.
+ * @param value - parsed tool arguments.
+ * @param out - accumulator.
+ * @param depth - recursion guard.
+ * @returns the raw path strings found.
+ */
+function pathValues(value, out = [], depth = 0) {
+  if (depth > 4 || value === null || typeof value !== 'object') return out
+  if (Array.isArray(value)) {
+    for (const item of value) pathValues(item, out, depth + 1)
+    return out
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === 'string') {
+      if (PATH_KEYS.test(key)) out.push(entry)
+    } else if (entry !== null && typeof entry === 'object') {
+      pathValues(entry, out, depth + 1)
+    }
+  }
+  return out
+}
+
+/**
  * Quote one path as a PowerShell single-quoted literal.
  * @param value - raw path text.
  * @returns the quoted literal.
@@ -291,6 +317,10 @@ export function apply(ctx, rawConfig) {
   function stateOf(agent) {
     let state = states.get(agent.id)
     if (state !== undefined) return state
+    if (states.size >= 256) {
+      const oldest = states.keys().next().value
+      if (oldest !== undefined) states.delete(oldest)
+    }
     state = {
       date: formatDate(agent.session?.header?.createdAt),
       folder: null,
@@ -299,6 +329,7 @@ export function apply(ctx, rawConfig) {
       lastPath: null,
       fallbackTopic: null,
       baseline: null,
+      writes: new Set(),
       moved: [],
       busy: false,
     }
@@ -365,8 +396,12 @@ export function apply(ctx, rawConfig) {
     if (typeof state.adopted === 'string') return
     const candidates = entries.filter(entry => entry.type === 'directory' && DATED_FOLDER.test(entry.name) && !baseline.has(entry.name))
     if (candidates.length === 0) return
-    const known = typeof state.folder === 'string' ? candidates.find(entry => entry.name === state.folder) : undefined
-    const chosen = known ?? candidates.slice().sort((left, right) => left.name.localeCompare(right.name))[0]
+    // Only a folder this conversation itself wrote into counts as its own; another
+    // conversation working in the same directory keeps its folders unclaimed.
+    const owned = candidates.filter(entry => [...state.writes].some(written => written.startsWith(`${entry.name}/`)))
+    if (owned.length === 0) return
+    const known = typeof state.folder === 'string' ? owned.find(entry => entry.name === state.folder) : undefined
+    const chosen = known ?? owned.slice().sort((left, right) => left.name.localeCompare(right.name))[0]
     state.adopted = chosen.name
     state.frozen = true
   }
@@ -746,6 +781,29 @@ export function apply(ctx, rawConfig) {
     }
   })
 
+  ctx.on('tools/result', exec => {
+    if (!opts.enabled) return
+    try {
+      const agent = exec?.agent
+      if (agent === undefined || agent === null || !participates(agent)) return
+      const values = pathValues(exec.arguments)
+      if (values.length === 0) return
+      const state = stateOf(agent)
+      const base = baseDirOf(agent)
+      for (const raw of values) {
+        const relativePath = relative(base, isAbsolute(raw) ? raw : resolve(base, raw))
+        if (relativePath.length === 0 || relativePath.startsWith('..') || isAbsolute(relativePath)) continue
+        state.writes.add(relativePath.split(sep).join('/'))
+        if (state.writes.size > 200) {
+          const oldest = state.writes.values().next().value
+          if (oldest !== undefined) state.writes.delete(oldest)
+        }
+      }
+    } catch {
+      /* tracking a write is best effort; it must never disturb the tool result */
+    }
+  })
+
   ctx.on('agent/turn-stopping', async ({ agent }) => {
     if (!opts.enabled || !opts.autoArchive || !participates(agent)) return
     try {
@@ -759,9 +817,5 @@ export function apply(ctx, rawConfig) {
     if (!opts.enabled || !opts.guidance) return
     if (event?.type !== 'session/title') return
     void maybeAdoptTitle(session.id)
-  })
-
-  ctx.on('agent/disposed', ({ agent }) => {
-    states.delete(agent.id)
   })
 }

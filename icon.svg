@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Conversation output folder">
+  <defs>
+    <linearGradient id="ca-folder" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#3f8bff"/>
+    </linearGradient>
+  </defs>
+  <path d="M6 15.5A4.5 4.5 0 0 1 10.5 11h13.1a4.5 4.5 0 0 1 3.5 1.7L30.4 17h23.1a4.5 4.5 0 0 1 4.5 4.5V47a4.5 4.5 0 0 1-4.5 4.5h-43A4.5 4.5 0 0 1 6 47Z" fill="url(#ca-folder)"/>
+  <rect x="17.5" y="27.5" width="29" height="19.5" rx="4" fill="#ffffff" opacity="0.96"/>
+  <path d="M24 34.5h16M24 40h10" stroke="#4b6bff" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="45.5" cy="21.5" r="7.5" fill="#ffffff" opacity="0.96"/>
+  <path d="M45.5 18.2v3.6l2.4 1.6" stroke="#4b6bff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

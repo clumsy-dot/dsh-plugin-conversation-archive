@@ -1,0 +1,767 @@
+/**
+ * conversation-archive — keep each conversation's generated files inside one
+ * folder named `<YYYY-MM-DD>_<topic>` in the Session working directory instead
+ * of scattering them in its root.
+ *
+ * Two mechanisms cooperate:
+ * 1. Guidance: a prompt runtime context tells the model the exact folder for
+ *    this conversation and that deliverables belong there, so files are usually
+ *    created in the right place in the first place.
+ * 2. Sweep: files that still appear in the working-directory root during the
+ *    conversation are moved into that folder at the end of the turn (and on
+ *    demand through the `archive_outputs` tool).
+ *
+ * Only the root of the working directory is ever touched, never directories and
+ * never files that already existed when the conversation started. Relocation
+ * uses `ctx.fs.moveFile` for text files and a shell rename for binary or large
+ * ones, because the filesystem seam only reads and writes UTF-8 text.
+ */
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+
+/** Stable Loader identity. */
+export const name = 'conversation-archive'
+
+/** Prompt context placement: after the runtime facts owned by the Harness. */
+const CONTEXT_ORDER = 130
+
+/** Context registry name. */
+const CONTEXT_NAME = 'conversation-archive'
+
+/** Hard service dependencies. */
+export const inject = ['fs', 'workingDirectory', 'systemPrompt', 'tools']
+
+/** Every tunable, with its deployment default. */
+const DEFAULTS = {
+  enabled: true,
+  autoArchive: true,
+  guidance: true,
+  baseDir: '',
+  topicMaxChars: 12,
+  skipDotEntries: true,
+  ignorePatterns: ['.git', 'node_modules', '~$*', '*.tmp', '*.log'],
+  maxTextMoveBytes: 2 * 1024 * 1024,
+  turnEndBudgetMs: 8000,
+  includeSubagents: true,
+}
+
+/** Windows device names may not be used as a folder name. */
+const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i
+
+/** A conversation folder the model created for itself: a date prefix and a topic. */
+const DATED_FOLDER = /^\d{4}-\d{2}-\d{2}_./u
+
+/** Openers that carry no summarizing value once the topic is truncated. */
+const FILLER_OPENER = /^(?:请|麻烦|帮我|帮忙|给我|我想|我想要|我需要|能不能|可以|希望|做一个|写一个|搞一个|弄一个)+/u
+
+/** Characters no Windows path segment may contain (control codes included). */
+const ILLEGAL_CHARS = /[<>:"/\\|?*\u0000-\u001f\u007f]/g
+
+/**
+ * Merge the Loader row's config over the defaults, keeping only usable values.
+ * An unusable value is reported once and replaced by its default.
+ * @param raw - the row config object, possibly absent or malformed.
+ * @param warn - sink for a human-readable diagnostic.
+ * @returns the effective configuration.
+ */
+function resolveConfig(raw, warn) {
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const config = { ...DEFAULTS }
+  const pick = (key, test, coerce) => {
+    if (!(key in source)) return
+    const value = source[key]
+    if (test(value)) config[key] = coerce === undefined ? value : coerce(value)
+    else warn(`config "${key}" is invalid; using ${JSON.stringify(DEFAULTS[key])}`)
+  }
+  const isBool = value => typeof value === 'boolean'
+  const isString = value => typeof value === 'string'
+  const isNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
+  pick('enabled', isBool)
+  pick('autoArchive', isBool)
+  pick('guidance', isBool)
+  pick('skipDotEntries', isBool)
+  pick('includeSubagents', isBool)
+  pick('baseDir', isString)
+  pick('topicMaxChars', value => isNumber(value) && value >= 1, value => Math.floor(value))
+  pick('maxTextMoveBytes', isNumber, value => Math.floor(value))
+  pick('turnEndBudgetMs', isNumber, value => Math.floor(value))
+  pick('ignorePatterns', value => Array.isArray(value) && value.every(entry => typeof entry === 'string'))
+  config.ignorePatterns = config.ignorePatterns.map(entry => entry.trim()).filter(entry => entry.length > 0)
+  return config
+}
+
+/**
+ * Render one timestamp as a local calendar date.
+ * @param timestamp - epoch milliseconds, or anything else for "now".
+ * @returns `YYYY-MM-DD`.
+ */
+function formatDate(timestamp) {
+  const date = new Date(typeof timestamp === 'number' && Number.isFinite(timestamp) ? timestamp : Date.now())
+  const pad = value => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/**
+ * Reduce arbitrary conversation text to one filesystem-safe folder fragment.
+ * @param input - a session title or the first user prompt.
+ * @param maxChars - maximum kept code points.
+ * @returns a non-empty folder fragment without separators or trailing dots.
+ */
+function sanitizeTopic(input, maxChars) {
+  let text = typeof input === 'string' ? input : ''
+  text = text.split(/\r?\n/u)[0] ?? ''
+  text = text.replace(/```[\s\S]*?```/gu, ' ')
+  text = text.replace(/\[([^\]]*)\]\([^)]*\)/gu, '$1')
+  text = text.replace(/[#*_>`~]+/gu, ' ')
+  text = text.replace(ILLEGAL_CHARS, '-')
+  text = text.replace(/[\s\u3000]+/gu, '-').replace(/-{2,}/gu, '-')
+  text = text.replace(/^[.\-\s]+|[.\-\s]+$/gu, '')
+  text = Array.from(text).slice(0, Math.max(1, maxChars)).join('')
+  text = text.replace(/^[.\-\s]+|[.\-\s]+$/gu, '')
+  if (text.length === 0) text = 'untitled'
+  if (RESERVED_NAME.test(text)) text = `_${text}`
+  return text.slice(0, 60)
+}
+
+/**
+ * Reduce a prompt or title to the clause that best stands in for a summary:
+ * the first short sentence with a leading filler opener removed.
+ * @param text - raw title, prompt, or tool-supplied topic.
+ * @returns the clause to sanitize.
+ */
+function provisionalTopic(text) {
+  const whole = typeof text === 'string' ? text : ''
+  const firstClause = whole.split(/[。！!？?；;，,、：:\n]/u)[0] ?? ''
+  const clause = firstClause.trim().length > 0 ? firstClause : whole
+  return clause.trim().replace(FILLER_OPENER, '').trim()
+}
+
+/**
+ * Join the conversation date and topic into one folder name.
+ * @param date - `YYYY-MM-DD` of the conversation.
+ * @param topic - raw title, prompt clause, or explicit topic.
+ * @param maxChars - maximum topic code points.
+ * @returns the folder basename.
+ */
+function buildFolderName(date, topic, maxChars) {
+  return `${date}_${sanitizeTopic(provisionalTopic(topic), maxChars)}`
+}
+
+/**
+ * Extract the text of a message's blocks.
+ * @param message - any message-shaped record.
+ * @returns the concatenated text, or an empty string.
+ */
+function messageText(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return parts.join('\n').trim()
+}
+
+/**
+ * Read the first user-authored message of a session for topic fallback.
+ * @param session - live session whose log is the source of truth.
+ * @returns the first non-empty user text, or an empty string.
+ */
+function firstUserText(session) {
+  let events
+  try {
+    events = session.snapshotEvents()
+  } catch {
+    return ''
+  }
+  for (const event of events) {
+    if (event?.type !== 'user/message') continue
+    const text = messageText(event.data)
+    if (text.length > 0) return text
+  }
+  return ''
+}
+
+/**
+ * Test a root entry name against the ignore patterns.
+ * Supports `*` inside one segment, otherwise a literal match.
+ * @param patterns - effective pattern list.
+ * @param candidate - root entry basename.
+ * @returns whether the entry is ignored.
+ */
+function isIgnored(patterns, candidate) {
+  for (const pattern of patterns) {
+    if (pattern === candidate) return true
+    if (!pattern.includes('*')) continue
+    const escaped = pattern.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')).join('[\\s\\S]*')
+    if (new RegExp(`^${escaped}$`, 'iu').test(candidate)) return true
+  }
+  return false
+}
+
+/**
+ * Quote one path as a PowerShell single-quoted literal.
+ * @param value - raw path text.
+ * @returns the quoted literal.
+ */
+function psQuote(value) {
+  return `'${value.replace(/'/gu, "''")}'`
+}
+
+/**
+ * Quote one path as a POSIX shell single-quoted word.
+ * @param value - raw path text.
+ * @returns the quoted word.
+ */
+function shQuote(value) {
+  return `'${value.replace(/'/gu, "'\\''")}'`
+}
+
+/**
+ * Read a collected child stream as text without throwing.
+ * @param handle - spawned process handle.
+ * @param stream - collector name.
+ * @returns the collected text, or an empty string.
+ */
+function collectedText(handle, stream) {
+  try {
+    const collected = handle?.collected?.[stream]
+    const page = collected?.readFrom(0)
+    return typeof page?.text === 'string' ? page.text : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Resolve a working directory that is safe to join onto.
+ * @param workingDirectory - the service providing the committed directory.
+ * @param session - the session whose directory is asked for.
+ * @returns an absolute directory path.
+ */
+function sessionDirectory(workingDirectory, session) {
+  try {
+    const directory = workingDirectory.get(session)
+    if (typeof directory === 'string' && directory.length > 0) return directory
+  } catch {
+    /* fall through to the process directory */
+  }
+  return process.cwd()
+}
+
+/**
+ * @param ctx - the plugin context.
+ * @param rawConfig - the Loader row's config.
+ */
+export function apply(ctx, rawConfig) {
+  /** Per-session state; a cache derived from the session log and the root listing. */
+  const states = new Map()
+
+  /**
+   * Report a non-fatal problem without disturbing the caller.
+   * @param message - what happened.
+   */
+  function warn(message) {
+    try {
+      ctx.logger.warn(`conversation-archive: ${message}`)
+    } catch {
+      /* a missing logger must never break the plugin */
+    }
+  }
+
+  const opts = resolveConfig(rawConfig, message => warn(message))
+
+  /**
+   * Whether this session takes part at all.
+   * @param agent - the agent to inspect.
+   * @returns participation flag.
+   */
+  function participates(agent) {
+    const session = agent?.session
+    if (session === undefined || session === null) return false
+    if (opts.includeSubagents) return true
+    const header = session.header ?? {}
+    return header.origin !== 'subagent' && (header.delegationDepth ?? 0) === 0
+  }
+
+  /**
+   * Read or create the state for one agent.
+   * @param agent - the agent being served.
+   * @returns its mutable state record.
+   */
+  function stateOf(agent) {
+    let state = states.get(agent.id)
+    if (state !== undefined) return state
+    state = {
+      date: formatDate(agent.session?.header?.createdAt),
+      folder: null,
+      adopted: null,
+      frozen: false,
+      lastPath: null,
+      fallbackTopic: null,
+      baseline: null,
+      moved: [],
+      busy: false,
+    }
+    states.set(agent.id, state)
+    return state
+  }
+
+  /**
+   * Absolute directory that holds the conversation folder.
+   * @param agent - the agent whose session directory applies.
+   * @returns absolute base directory.
+   */
+  function baseDirOf(agent) {
+    const directory = sessionDirectory(ctx.workingDirectory, agent.session)
+    if (opts.baseDir.length === 0) return directory
+    return resolve(directory, opts.baseDir)
+  }
+
+  /**
+   * The folder this conversation already settled on, if any.
+   * @param state - the conversation state.
+   * @returns the adopted folder the model created, else a frozen folder, else null.
+   */
+  function settledFolder(state) {
+    if (typeof state.adopted === 'string' && state.adopted.length > 0) return state.adopted
+    if (state.frozen && typeof state.folder === 'string' && state.folder.length > 0) return state.folder
+    return null
+  }
+
+  /**
+   * Current folder basename: the settled one, else a provisional name derived
+   * from the title or the first prompt.
+   * @param agent - the agent being served.
+   * @param state - its state record.
+   * @returns the folder basename.
+   */
+  function folderOf(agent, state) {
+    const settled = settledFolder(state)
+    if (settled !== null) return settled
+    let topic = ''
+    try {
+      const title = ctx.get('sessionTitle')?.get(agent.session)?.title
+      if (typeof title === 'string' && title.trim().length > 0) topic = title
+    } catch {
+      /* a missing title service only costs the nicer name */
+    }
+    if (topic.length === 0) {
+      if (state.fallbackTopic === null) state.fallbackTopic = firstUserText(agent.session)
+      topic = state.fallbackTopic
+    }
+    if (topic.length === 0) topic = `session-${String(agent.id).replace(/^session-/, '').slice(0, 6)}`
+    state.folder = buildFolderName(state.date, topic, opts.topicMaxChars)
+    return state.folder
+  }
+
+  /**
+   * Adopt the dated folder the model created for this conversation, so later
+   * stray files join it instead of a folder of our own naming.
+   * @param state - the conversation state.
+   * @param entries - current root listing.
+   * @param baseline - names known before this conversation.
+   */
+  function adoptDatedFolder(state, entries, baseline) {
+    if (typeof state.adopted === 'string') return
+    const candidates = entries.filter(entry => entry.type === 'directory' && DATED_FOLDER.test(entry.name) && !baseline.has(entry.name))
+    if (candidates.length === 0) return
+    const known = typeof state.folder === 'string' ? candidates.find(entry => entry.name === state.folder) : undefined
+    const chosen = known ?? candidates.slice().sort((left, right) => left.name.localeCompare(right.name))[0]
+    state.adopted = chosen.name
+    state.frozen = true
+  }
+
+  /**
+   * Capture the root listing that distinguishes conversation output from files
+   * that were already there. The first call after a load wins, so a plugin
+   * reload never sweeps a directory it never observed.
+   * @param agent - the agent being served.
+   * @param state - its state record.
+   * @returns the baseline names.
+   */
+  async function ensureBaseline(agent, state) {
+    if (state.baseline !== null) return state.baseline
+    const names = new Set()
+    try {
+      const target = await ctx.fs.resolve(baseDirOf(agent))
+      for (const entry of await ctx.fs.listDir(target)) names.add(entry.name)
+    } catch {
+      /* an unreadable root simply starts as empty */
+    }
+    state.baseline = names
+    return names
+  }
+
+  /**
+   * Adopt a late session title as the folder name while the folder does not yet
+   * exist on disk; once output landed there, the name is frozen.
+   * @param sessionId - the session whose title changed.
+   */
+  async function maybeAdoptTitle(sessionId) {
+    const state = states.get(sessionId)
+    if (state === undefined || state.frozen) return
+    if (state.moved.length > 0) {
+      state.frozen = true
+      return
+    }
+    if (typeof state.lastPath !== 'string' || state.lastPath.length === 0) return
+    try {
+      const info = await ctx.fs.stat(await ctx.fs.resolve(state.lastPath))
+      if (info !== undefined) state.frozen = true
+    } catch {
+      /* absent means the model never wrote there, so the better name may win */
+    }
+  }
+
+  /**
+   * Pick a destination path inside the folder that does not collide.
+   * @param directory - absolute destination folder.
+   * @param fileName - desired basename.
+   * @returns the free absolute path.
+   */
+  async function freeDestination(directory, fileName) {
+    const extension = extname(fileName)
+    const stem = extension.length > 0 ? fileName.slice(0, -extension.length) : fileName
+    for (let attempt = 1; attempt <= 50; attempt += 1) {
+      const candidate = attempt === 1 ? fileName : `${stem} (${attempt})${extension}`
+      const absolute = join(directory, candidate)
+      const info = await ctx.fs.stat(await ctx.fs.resolve(absolute))
+      if (info === undefined) return absolute
+    }
+    throw new Error(`目标目录里同名文件过多：${fileName}`)
+  }
+
+  /**
+   * Move one file with the shell, which is the only path for binary content.
+   * @param source - absolute source path.
+   * @param destination - absolute destination path.
+   */
+  async function shellMove(source, destination) {
+    const subprocess = ctx.get('subprocess')
+    if (subprocess === undefined || subprocess === null) throw new Error('当前组合没有 subprocess 服务，无法移动二进制文件')
+    const environment = await subprocess.terminalEnvironment()
+    const directory = dirname(destination)
+    let argv
+    if (environment?.platform === 'windows') {
+      let executable
+      for (const command of ['pwsh', 'powershell.exe']) {
+        try {
+          executable = await subprocess.resolveExecutable(command)
+          break
+        } catch {
+          /* try the next PowerShell host */
+        }
+      }
+      if (executable === undefined) throw new Error('找不到可用的 PowerShell')
+      const script = `New-Item -ItemType Directory -Force -Path ${psQuote(directory)} | Out-Null; `
+        + `Move-Item -LiteralPath ${psQuote(source)} -Destination ${psQuote(destination)} -Force`
+      argv = [executable, '-NoProfile', '-NonInteractive', '-Command', script]
+    } else {
+      const script = `mkdir -p -- ${shQuote(directory)} && mv -f -- ${shQuote(source)} ${shQuote(destination)}`
+      argv = ['/bin/sh', '-c', script]
+    }
+    const handle = subprocess.spawn({
+      argv,
+      cwd: dirname(source),
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } },
+      graceMs: 3000,
+    })
+    const outcome = await handle.done
+    if (outcome?.exitCode !== 0) {
+      const detail = collectedText(handle, 'stderr').trim()
+      throw new Error(`系统命令移动失败（退出码 ${outcome?.exitCode ?? '未知'}）${detail.length > 0 ? `：${detail.slice(0, 200)}` : ''}`)
+    }
+  }
+
+  /**
+   * Move one root entry into the conversation folder.
+   * @param entry - listed root entry.
+   * @param destination - absolute destination path.
+   */
+  async function moveEntry(entry, destination) {
+    const size = entry.size
+    if (size === undefined || size <= opts.maxTextMoveBytes) {
+      try {
+        await ctx.fs.moveFile(entry.target, await ctx.fs.resolve(destination), {})
+        return
+      } catch (error) {
+        /* The seam rejects binary content (and may refuse a locked file); the shell rename covers both. */
+        warn(`文件工具移动 ${entry.name} 未成功（${error instanceof Error ? error.message : String(error)}），改用系统命令`)
+      }
+    }
+    await shellMove(entry.target.displayPath, destination)
+  }
+
+  /**
+   * Move this conversation's root files into its folder.
+   * @param agent - the agent whose session owns them.
+   * @param request - optional explicit root-relative paths.
+   * @returns what was moved and what was left alone.
+   */
+  async function sweep(agent, request = {}) {
+    const state = stateOf(agent)
+    const explicit = Array.isArray(request.paths) ? request.paths : null
+    const result = { folder: '', moved: [], skipped: [] }
+    if (state.busy) {
+      result.skipped.push({ path: '*', reason: '一次归拢还没结束' })
+      return result
+    }
+    state.busy = true
+    const started = Date.now()
+    try {
+      const requestedTopic = typeof request.topic === 'string' ? request.topic.trim() : ''
+      if (requestedTopic.length > 0 && settledFolder(state) === null) {
+        state.folder = buildFolderName(state.date, requestedTopic, opts.topicMaxChars)
+        state.frozen = true
+      }
+      const isFirstObservation = state.baseline === null
+      const baseline = await ensureBaseline(agent, state)
+      const base = baseDirOf(agent)
+      if (isFirstObservation) {
+        result.folder = join(base, folderOf(agent, state))
+        result.skipped.push({ path: '*', reason: '本轮只记录了目录基线，下一次归拢起生效' })
+        return result
+      }
+      let entries
+      try {
+        entries = await ctx.fs.listDir(await ctx.fs.resolve(base))
+      } catch (error) {
+        result.folder = join(base, folderOf(agent, state))
+        result.skipped.push({ path: '*', reason: `无法列出工作目录：${error instanceof Error ? error.message : String(error)}` })
+        return result
+      }
+      adoptDatedFolder(state, entries, baseline)
+      const folder = folderOf(agent, state)
+      result.folder = join(base, folder)
+      const byName = new Map(entries.map(entry => [entry.name, entry]))
+      const candidates = []
+      if (explicit === null) {
+        for (const entry of entries) {
+          if (baseline.has(entry.name)) continue
+          if (entry.type !== 'file') {
+            baseline.add(entry.name)
+            continue
+          }
+          if (opts.skipDotEntries && entry.name.startsWith('.')) {
+            baseline.add(entry.name)
+            continue
+          }
+          if (isIgnored(opts.ignorePatterns, entry.name)) {
+            baseline.add(entry.name)
+            continue
+          }
+          candidates.push(entry)
+        }
+      } else {
+        for (const raw of explicit) {
+          if (typeof raw !== 'string' || raw.trim().length === 0) {
+            result.skipped.push({ path: String(raw), reason: '空路径' })
+            continue
+          }
+          const absolute = isAbsolute(raw) ? raw : resolve(base, raw)
+          const relativeName = relative(base, absolute)
+          if (relativeName.length === 0 || relativeName.startsWith('..') || isAbsolute(relativeName) || relativeName.includes(sep)) {
+            result.skipped.push({ path: raw, reason: '不是工作区根目录里的文件' })
+            continue
+          }
+          const entry = byName.get(relativeName)
+          if (entry === undefined) {
+            result.skipped.push({ path: raw, reason: '根目录下没有这个文件' })
+            continue
+          }
+          if (entry.type !== 'file') {
+            result.skipped.push({ path: raw, reason: '不是普通文件' })
+            continue
+          }
+          if (isIgnored(opts.ignorePatterns, entry.name)) {
+            result.skipped.push({ path: raw, reason: '命中忽略规则' })
+            continue
+          }
+          candidates.push(entry)
+        }
+      }
+      if (candidates.length === 0) return result
+      const directory = join(base, folder)
+      for (const entry of candidates) {
+        if (Date.now() - started > opts.turnEndBudgetMs) {
+          result.skipped.push({ path: entry.name, reason: '超出时间预算，下一次归拢重试' })
+          continue
+        }
+        try {
+          const destination = await freeDestination(directory, entry.name)
+          await moveEntry(entry, destination)
+          result.moved.push({ from: entry.name, to: `${folder}/${destination.slice(directory.length + 1)}` })
+          baseline.add(entry.name)
+          state.frozen = true
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          result.skipped.push({ path: entry.name, reason })
+          warn(`移动 ${entry.name} 失败：${reason}`)
+        }
+      }
+      if (result.moved.length > 0) {
+        state.moved.push(...result.moved)
+        if (state.moved.length > 40) state.moved.splice(0, state.moved.length - 40)
+      }
+      return result
+    } finally {
+      state.busy = false
+    }
+  }
+
+  /**
+   * Build the prompt section naming this conversation's folder.
+   * @param agent - the agent the assembly is for.
+   * @returns the section text, or an empty string when it does not apply.
+   */
+  function guidanceText(agent) {
+    try {
+      if (!participates(agent)) return ''
+      const state = stateOf(agent)
+      const base = baseDirOf(agent)
+      const settled = settledFolder(state)
+      if (settled !== null) {
+        const path = join(base, settled)
+        state.lastPath = path
+        const lines = [
+          '## 本次对话的产物目录',
+          `${path}${sep}`,
+          `- 你为用户产出的文件（文档、表格、图片、脚本、压缩包等）一律写到上面这个目录，引用时用 \`${settled}${sep}文件名\`；不要在 ${base} 根目录堆积新文件，也不要另建并列的顶层目录。`,
+          '- 项目源码、仓库文件照旧留在它们自己的目录里，这条约定只管你新产出的交付文件。',
+          '- 临时中间文件放系统临时目录，不要留在工作区。',
+          '- 结束前如果工作区根目录还有本次新生成的文件，先调用 archive_outputs 把它们归拢进去。',
+        ]
+        if (state.moved.length > 0) {
+          lines.push('- 已归拢到该目录：')
+          for (const entry of state.moved.slice(-10)) lines.push(`  - ${entry.from} → ${entry.to}`)
+        }
+        return lines.join('\n')
+      }
+      state.lastPath = null
+      return [
+        '## 本次对话的产物目录',
+        `今天 ${state.date}。`,
+        `- 交付文件统一放在工作区下的一个文件夹里：\`${state.date}_<主题>\`。\`<主题>\` 用不超过 ${opts.topicMaxChars} 个字概括这次对话在做的事（例如 \`题库转换\`、\`图标重绘\`），不要照抄提问原句。`,
+        '- 本次对话只用一个这样的文件夹：第一次建好后，之后所有交付文件都放进它，引用时写 `<文件夹>/文件名`。',
+        '- 临时中间文件放系统临时目录；不要把交付文件留在工作区根目录。',
+        '- 想让我来建这个文件夹的话，调用 archive_outputs 并给出 topic。',
+      ].join('\n')
+    } catch (error) {
+      warn(`提示词渲染失败：${error instanceof Error ? error.message : String(error)}`)
+      return ''
+    }
+  }
+
+  if (opts.guidance) {
+    ctx.systemPrompt.context({
+      name: CONTEXT_NAME,
+      order: CONTEXT_ORDER,
+      interpolate: false,
+      text: context => {
+        const agent = context?.agent
+        return agent === undefined || agent === null ? '' : guidanceText(agent)
+      },
+    })
+  }
+
+  ctx.tools.register({
+    name: 'archive_outputs',
+    description: '把本次对话在工作区根目录生成的文件归拢进本次对话的 `<日期>_<主题>` 文件夹，返回每个文件的新路径。交付文件本来就该写在那个文件夹里；本工具用于收拾漏在根目录的产物，或在还没建文件夹时用 `topic` 指定一个简短主题让它来建。',
+    parameters: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          description: '要归拢的根目录文件路径（相对或绝对）。省略时归拢本次对话在根目录新生成的全部文件。',
+          items: { type: 'string' },
+        },
+        topic: {
+          type: 'string',
+          description: `本次对话产物文件夹的主题，不超过 ${opts.topicMaxChars} 个字，如 \`题库转换\`。仅在该对话还没有产物文件夹时生效。`,
+        },
+      },
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          folder: { type: 'string' },
+          moved: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { from: { type: 'string' }, to: { type: 'string' } },
+              required: ['from', 'to'],
+              additionalProperties: false,
+            },
+          },
+          skipped: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: { path: { type: 'string' }, reason: { type: 'string' } },
+              required: ['path', 'reason'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['folder', 'moved', 'skipped'],
+        additionalProperties: false,
+      },
+      render: (args, value) => {
+        const moved = Array.isArray(value?.moved) ? value.moved : []
+        const skipped = Array.isArray(value?.skipped) ? value.skipped : []
+        const lines = [`产物目录：${value?.folder ?? ''}`]
+        if (moved.length === 0) lines.push('没有移动任何文件。')
+        else {
+          lines.push(`已归拢 ${moved.length} 个文件：`)
+          for (const entry of moved) lines.push(`- ${entry.from} → ${entry.to}`)
+        }
+        if (skipped.length > 0) {
+          lines.push('未处理：')
+          for (const entry of skipped) lines.push(`- ${entry.path}：${entry.reason}`)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(args, exec) {
+      const agent = exec?.agent
+      if (agent === undefined || agent === null) {
+        return { folder: '', moved: [], skipped: [{ path: '*', reason: '没有可用的会话上下文' }] }
+      }
+      if (!opts.enabled) {
+        return { folder: '', moved: [], skipped: [{ path: '*', reason: '插件已停用' }] }
+      }
+      return sweep(agent, { paths: args?.paths, topic: args?.topic })
+    },
+  })
+
+  ctx.on('agent/created', async ({ agent }) => {
+    if (!opts.enabled || !participates(agent)) return
+    try {
+      await ensureBaseline(agent, stateOf(agent))
+    } catch (error) {
+      warn(`记录目录基线失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  ctx.on('agent/turn-stopping', async ({ agent }) => {
+    if (!opts.enabled || !opts.autoArchive || !participates(agent)) return
+    try {
+      await sweep(agent)
+    } catch (error) {
+      warn(`回合结束归拢失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  ctx.on('session/event', (session, event) => {
+    if (!opts.enabled || !opts.guidance) return
+    if (event?.type !== 'session/title') return
+    void maybeAdoptTitle(session.id)
+  })
+
+  ctx.on('agent/disposed', ({ agent }) => {
+    states.delete(agent.id)
+  })
+}

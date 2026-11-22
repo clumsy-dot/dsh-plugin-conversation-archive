@@ -1,0 +1,45 @@
+{
+  "name": "dsh-conversation-archive",
+  "version": "1.0.0",
+  "description": "Put every conversation's output files into one <date>_<topic> folder inside the workspace.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "bundle",
+    "archive",
+    "folders",
+    "workspace"
+  ],
+  "license": "MIT",
+  "author": "clumsy-dot",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clumsy-dot/dsh-conversation-archive.git"
+  },
+  "homepage": "https://github.com/clumsy-dot/dsh-conversation-archive#readme",
+  "bugs": {
+    "url": "https://github.com/clumsy-dot/dsh-conversation-archive/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

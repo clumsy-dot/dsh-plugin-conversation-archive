@@ -1,5 +1,5 @@
 {
-  "name": "dsh-conversation-archive",
+  "name": "dsh-plugin-conversation-archive",
   "version": "1.0.1",
   "description": "Put every conversation's output files into one <date>_<topic> folder inside the workspace.",
   "type": "module",
@@ -31,11 +31,11 @@
   "author": "clumsy-dot",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/clumsy-dot/dsh-conversation-archive.git"
+    "url": "git+https://github.com/clumsy-dot/dsh-plugin-conversation-archive.git"
   },
-  "homepage": "https://github.com/clumsy-dot/dsh-conversation-archive#readme",
+  "homepage": "https://github.com/clumsy-dot/dsh-plugin-conversation-archive#readme",
   "bugs": {
-    "url": "https://github.com/clumsy-dot/dsh-conversation-archive/issues"
+    "url": "https://github.com/clumsy-dot/dsh-plugin-conversation-archive/issues"
   },
   "dsh": {
     "bundle": {

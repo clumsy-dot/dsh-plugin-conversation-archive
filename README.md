@@ -1,4 +1,4 @@
-# dsh-conversation-archive
+# dsh-plugin-conversation-archive
 
 把每次对话生成的文件收进工作目录下的一个文件夹，而不是散落在根目录：
 
@@ -27,26 +27,38 @@
 
 ## 安装
 
-插件包已发布在本仓库根目录，仓库带 GitHub 主题 [`dsh-plugin`](https://github.com/topics/dsh-plugin)。
+已发布到 npm，仓库同时带 GitHub 主题 [`dsh-plugin`](https://github.com/topics/dsh-plugin)。
 
-**从插件市场/插件管理器安装**（需要 DSH 0.2.2 或更新的版本）：
+**从 npm 安装**（最省事，需要 DSH 0.2.2 或更新的版本）：在 DSH 的 **Plugins → Add plugin** 里填包名
 
 ```
-plugin_manager install_bundle target=git+https://github.com/clumsy-dot/dsh-conversation-archive.git
+dsh-plugin-conversation-archive
 ```
 
-**本地目录安装**：把仓库克隆到任意目录，然后在 DSH 的 **Plugins → Add plugin** 里选择该目录，或
+或用命令
+
+```
+plugin_manager install_bundle target=dsh-plugin-conversation-archive
+```
+
+**从 GitHub 安装**：
+
+```
+plugin_manager install_bundle target=git+https://github.com/clumsy-dot/dsh-plugin-conversation-archive.git
+```
+
+**本地目录安装**：把仓库克隆到任意目录，在 **Plugins → Add plugin** 里填该目录路径，或
 
 ```
 plugin_manager install_bundle target=<仓库目录的绝对路径>
 ```
 
-安装成功后会在 Plugins 里出现「对话产物归档」一行，新开一个对话即可生效。
+安装成功后会在 Plugins 里出现 `dsh-plugin-conversation-archive` 一行，新开一个对话即可生效。
 
 ## 卸载
 
 ```
-plugin_manager remove_bundle target=dsh-conversation-archive
+plugin_manager remove_bundle target=dsh-plugin-conversation-archive
 ```
 
 已经归拢过的文件夹不会被自动搬回。

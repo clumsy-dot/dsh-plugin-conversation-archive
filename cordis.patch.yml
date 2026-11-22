@@ -1,5 +1,5 @@
-# dsh-conversation-archive bundle patch: inserts the conversation output archive row.
+# dsh-plugin-conversation-archive bundle patch: inserts the conversation output archive row.
 - insert:
     - id: conversation-archive
-      name: 'dsh-conversation-archive'
+      name: 'dsh-plugin-conversation-archive'
       config: {}

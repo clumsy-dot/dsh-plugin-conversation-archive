@@ -114,7 +114,7 @@ function sanitizeTopic(input, maxChars) {
   text = text.split(/\r?\n/u)[0] ?? ''
   text = text.replace(/```[\s\S]*?```/gu, ' ')
   text = text.replace(/\[([^\]]*)\]\([^)]*\)/gu, '$1')
-  text = text.replace(/[#*_>`~]+/gu, ' ')
+  text = text.replace(/[#*>`~]+/gu, ' ')
   text = text.replace(ILLEGAL_CHARS, '-')
   text = text.replace(/[\s\u3000]+/gu, '-').replace(/-{2,}/gu, '-')
   text = text.replace(/^[.\-\s]+|[.\-\s]+$/gu, '')
@@ -225,6 +225,32 @@ function pathValues(value, out = [], depth = 0) {
 }
 
 /**
+ * Collect the conversation folder names a tool call mentions anywhere in its
+ * arguments — including a path embedded in a generated script, which is how
+ * non-text deliverables usually land in their folder.
+ * @param value - parsed tool arguments.
+ * @param out - accumulator of folder basenames.
+ * @param depth - recursion guard.
+ * @returns the mentioned folder names.
+ */
+function mentionedFolders(value, out = new Set(), depth = 0) {
+  if (depth > 4 || value === null || typeof value !== 'object') return out
+  if (Array.isArray(value)) {
+    for (const item of value) mentionedFolders(item, out, depth + 1)
+    return out
+  }
+  for (const entry of Object.values(value)) {
+    if (typeof entry === 'string') {
+      if (entry.length > 20000) continue
+      for (const match of entry.matchAll(/\d{4}-\d{2}-\d{2}_[^\s"'`/\\<>|:*?]+/gu)) out.add(match[0])
+    } else if (entry !== null && typeof entry === 'object') {
+      mentionedFolders(entry, out, depth + 1)
+    }
+  }
+  return out
+}
+
+/**
  * Quote one path as a PowerShell single-quoted literal.
  * @param value - raw path text.
  * @returns the quoted literal.
@@ -326,10 +352,11 @@ export function apply(ctx, rawConfig) {
       folder: null,
       adopted: null,
       frozen: false,
-      lastPath: null,
       fallbackTopic: null,
       baseline: null,
       writes: new Set(),
+      mentions: new Set(),
+      dirty: false,
       moved: [],
       busy: false,
     }
@@ -377,8 +404,15 @@ export function apply(ctx, rawConfig) {
       /* a missing title service only costs the nicer name */
     }
     if (topic.length === 0) {
-      if (state.fallbackTopic === null) state.fallbackTopic = firstUserText(agent.session)
-      topic = state.fallbackTopic
+      // The first prompt is not committed at the very first assembly, so only a
+      // non-empty read may be cached; otherwise the later read is used.
+      if (state.fallbackTopic === null) {
+        const first = firstUserText(agent.session)
+        if (first.length > 0) state.fallbackTopic = first
+        topic = first
+      } else {
+        topic = state.fallbackTopic
+      }
     }
     if (topic.length === 0) topic = `session-${String(agent.id).replace(/^session-/, '').slice(0, 6)}`
     state.folder = buildFolderName(state.date, topic, opts.topicMaxChars)
@@ -396,9 +430,11 @@ export function apply(ctx, rawConfig) {
     if (typeof state.adopted === 'string') return
     const candidates = entries.filter(entry => entry.type === 'directory' && DATED_FOLDER.test(entry.name) && !baseline.has(entry.name))
     if (candidates.length === 0) return
-    // Only a folder this conversation itself wrote into counts as its own; another
+    // Only a folder this conversation itself wrote into — or named in a tool call,
+    // such as a script that writes its output — counts as its own. Another
     // conversation working in the same directory keeps its folders unclaimed.
-    const owned = candidates.filter(entry => [...state.writes].some(written => written.startsWith(`${entry.name}/`)))
+    const owned = candidates.filter(entry => state.mentions.has(entry.name)
+      || [...state.writes].some(written => written.startsWith(`${entry.name}/`)))
     if (owned.length === 0) return
     const known = typeof state.folder === 'string' ? owned.find(entry => entry.name === state.folder) : undefined
     const chosen = known ?? owned.slice().sort((left, right) => left.name.localeCompare(right.name))[0]
@@ -410,42 +446,24 @@ export function apply(ctx, rawConfig) {
    * Capture the root listing that distinguishes conversation output from files
    * that were already there. The first call after a load wins, so a plugin
    * reload never sweeps a directory it never observed.
+   *
+   * A failed listing is NOT an empty baseline: treating it as empty would make
+   * every existing file look newly generated on the next sweep.
    * @param agent - the agent being served.
    * @param state - its state record.
-   * @returns the baseline names.
+   * @returns the baseline names, or why the directory could not be read.
    */
   async function ensureBaseline(agent, state) {
-    if (state.baseline !== null) return state.baseline
+    if (state.baseline !== null) return { names: state.baseline }
     const names = new Set()
     try {
       const target = await ctx.fs.resolve(baseDirOf(agent))
       for (const entry of await ctx.fs.listDir(target)) names.add(entry.name)
-    } catch {
-      /* an unreadable root simply starts as empty */
+    } catch (error) {
+      return { names: null, reason: error instanceof Error ? error.message : String(error) }
     }
     state.baseline = names
-    return names
-  }
-
-  /**
-   * Adopt a late session title as the folder name while the folder does not yet
-   * exist on disk; once output landed there, the name is frozen.
-   * @param sessionId - the session whose title changed.
-   */
-  async function maybeAdoptTitle(sessionId) {
-    const state = states.get(sessionId)
-    if (state === undefined || state.frozen) return
-    if (state.moved.length > 0) {
-      state.frozen = true
-      return
-    }
-    if (typeof state.lastPath !== 'string' || state.lastPath.length === 0) return
-    try {
-      const info = await ctx.fs.stat(await ctx.fs.resolve(state.lastPath))
-      if (info !== undefined) state.frozen = true
-    } catch {
-      /* absent means the model never wrote there, so the better name may win */
-    }
+    return { names }
   }
 
   /**
@@ -501,7 +519,25 @@ export function apply(ctx, rawConfig) {
       stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } },
       graceMs: 3000,
     })
-    const outcome = await handle.done
+    // A serial turn-stopping listener may not hang on a stuck child.
+    const limitMs = Math.min(Math.max(opts.turnEndBudgetMs, 3000), 15000)
+    let timer
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`系统命令超时（${limitMs}ms）`)), limitMs)
+    })
+    let outcome
+    try {
+      outcome = await Promise.race([handle.done, deadline])
+    } catch (error) {
+      try {
+        handle.terminate()
+      } catch {
+        /* the child is already gone; the original failure is the one to report */
+      }
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
     if (outcome?.exitCode !== 0) {
       const detail = collectedText(handle, 'stderr').trim()
       throw new Error(`系统命令移动失败（退出码 ${outcome?.exitCode ?? '未知'}）${detail.length > 0 ? `：${detail.slice(0, 200)}` : ''}`)
@@ -512,19 +548,27 @@ export function apply(ctx, rawConfig) {
    * Move one root entry into the conversation folder.
    * @param entry - listed root entry.
    * @param destination - absolute destination path.
+   * @returns whether the entry was moved; false when it disappeared first.
    */
   async function moveEntry(entry, destination) {
     const size = entry.size
     if (size === undefined || size <= opts.maxTextMoveBytes) {
       try {
         await ctx.fs.moveFile(entry.target, await ctx.fs.resolve(destination), {})
-        return
+        return true
       } catch (error) {
-        /* The seam rejects binary content (and may refuse a locked file); the shell rename covers both. */
-        warn(`文件工具移动 ${entry.name} 未成功（${error instanceof Error ? error.message : String(error)}），改用系统命令`)
+        const code = error?.code
+        /* A source that vanished has nothing left to move. */
+        if (code === 'FS_NOT_FOUND') return false
+        // Binary and oversized content cannot travel through the text seam, so this
+        // fallback is routine; any other failure is worth reporting before retrying.
+        if (code !== 'FS_NOT_TEXT' && code !== 'FS_TOO_LARGE') {
+          warn(`文件工具移动 ${entry.name} 未成功（${error instanceof Error ? error.message : String(error)}），改用系统命令`)
+        }
       }
     }
     await shellMove(entry.target.displayPath, destination)
+    return true
   }
 
   /**
@@ -536,11 +580,15 @@ export function apply(ctx, rawConfig) {
   async function sweep(agent, request = {}) {
     const state = stateOf(agent)
     const explicit = Array.isArray(request.paths) ? request.paths : null
-    const result = { folder: '', moved: [], skipped: [] }
+    const base = baseDirOf(agent)
+    const result = { folder: join(base, folderOf(agent, state)), moved: [], skipped: [] }
     if (state.busy) {
       result.skipped.push({ path: '*', reason: '一次归拢还没结束' })
       return result
     }
+    // A turn that ran no tool cannot have produced conversation output, so the
+    // per-turn directory walk is skipped for pure-conversation turns.
+    if (explicit === null && !state.dirty) return result
     state.busy = true
     const started = Date.now()
     try {
@@ -551,7 +599,10 @@ export function apply(ctx, rawConfig) {
       }
       const isFirstObservation = state.baseline === null
       const baseline = await ensureBaseline(agent, state)
-      const base = baseDirOf(agent)
+      if (baseline.names === null) {
+        result.skipped.push({ path: '*', reason: `无法记录工作目录基线：${baseline.reason}` })
+        return result
+      }
       if (isFirstObservation) {
         result.folder = join(base, folderOf(agent, state))
         result.skipped.push({ path: '*', reason: '本轮只记录了目录基线，下一次归拢起生效' })
@@ -561,28 +612,29 @@ export function apply(ctx, rawConfig) {
       try {
         entries = await ctx.fs.listDir(await ctx.fs.resolve(base))
       } catch (error) {
-        result.folder = join(base, folderOf(agent, state))
         result.skipped.push({ path: '*', reason: `无法列出工作目录：${error instanceof Error ? error.message : String(error)}` })
         return result
       }
-      adoptDatedFolder(state, entries, baseline)
+      state.dirty = false
+      adoptDatedFolder(state, entries, baseline.names)
       const folder = folderOf(agent, state)
       result.folder = join(base, folder)
       const byName = new Map(entries.map(entry => [entry.name, entry]))
       const candidates = []
+      const seen = new Set()
       if (explicit === null) {
         for (const entry of entries) {
-          if (baseline.has(entry.name)) continue
+          if (baseline.names.has(entry.name)) continue
           if (entry.type !== 'file') {
-            baseline.add(entry.name)
+            baseline.names.add(entry.name)
             continue
           }
           if (opts.skipDotEntries && entry.name.startsWith('.')) {
-            baseline.add(entry.name)
+            baseline.names.add(entry.name)
             continue
           }
           if (isIgnored(opts.ignorePatterns, entry.name)) {
-            baseline.add(entry.name)
+            baseline.names.add(entry.name)
             continue
           }
           candidates.push(entry)
@@ -612,6 +664,8 @@ export function apply(ctx, rawConfig) {
             result.skipped.push({ path: raw, reason: '命中忽略规则' })
             continue
           }
+          if (seen.has(entry.name)) continue
+          seen.add(entry.name)
           candidates.push(entry)
         }
       }
@@ -624,9 +678,13 @@ export function apply(ctx, rawConfig) {
         }
         try {
           const destination = await freeDestination(directory, entry.name)
-          await moveEntry(entry, destination)
+          if (!await moveEntry(entry, destination)) {
+            /* Gone between the listing and the move: nothing left to report. */
+            baseline.names.add(entry.name)
+            continue
+          }
           result.moved.push({ from: entry.name, to: `${folder}/${destination.slice(directory.length + 1)}` })
-          baseline.add(entry.name)
+          baseline.names.add(entry.name)
           state.frozen = true
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
@@ -657,7 +715,6 @@ export function apply(ctx, rawConfig) {
       const settled = settledFolder(state)
       if (settled !== null) {
         const path = join(base, settled)
-        state.lastPath = path
         const lines = [
           '## 本次对话的产物目录',
           `${path}${sep}`,
@@ -672,7 +729,6 @@ export function apply(ctx, rawConfig) {
         }
         return lines.join('\n')
       }
-      state.lastPath = null
       return [
         '## 本次对话的产物目录',
         `今天 ${state.date}。`,
@@ -775,7 +831,10 @@ export function apply(ctx, rawConfig) {
   ctx.on('agent/created', async ({ agent }) => {
     if (!opts.enabled || !participates(agent)) return
     try {
-      await ensureBaseline(agent, stateOf(agent))
+      const state = stateOf(agent)
+      state.dirty = false
+      const baseline = await ensureBaseline(agent, state)
+      if (baseline.names === null) warn(`记录目录基线失败：${baseline.reason}`)
     } catch (error) {
       warn(`记录目录基线失败：${error instanceof Error ? error.message : String(error)}`)
     }
@@ -786,17 +845,24 @@ export function apply(ctx, rawConfig) {
     try {
       const agent = exec?.agent
       if (agent === undefined || agent === null || !participates(agent)) return
-      const values = pathValues(exec.arguments)
-      if (values.length === 0) return
       const state = stateOf(agent)
+      // Any tool ran, so this turn may have produced output in the root.
+      state.dirty = true
       const base = baseDirOf(agent)
-      for (const raw of values) {
+      for (const raw of pathValues(exec.arguments)) {
         const relativePath = relative(base, isAbsolute(raw) ? raw : resolve(base, raw))
         if (relativePath.length === 0 || relativePath.startsWith('..') || isAbsolute(relativePath)) continue
         state.writes.add(relativePath.split(sep).join('/'))
         if (state.writes.size > 200) {
           const oldest = state.writes.values().next().value
           if (oldest !== undefined) state.writes.delete(oldest)
+        }
+      }
+      for (const name of mentionedFolders(exec.arguments)) {
+        state.mentions.add(name)
+        if (state.mentions.size > 50) {
+          const oldest = state.mentions.values().next().value
+          if (oldest !== undefined) state.mentions.delete(oldest)
         }
       }
     } catch {
@@ -811,11 +877,5 @@ export function apply(ctx, rawConfig) {
     } catch (error) {
       warn(`回合结束归拢失败：${error instanceof Error ? error.message : String(error)}`)
     }
-  })
-
-  ctx.on('session/event', (session, event) => {
-    if (!opts.enabled || !opts.guidance) return
-    if (event?.type !== 'session/title') return
-    void maybeAdoptTitle(session.id)
   })
 }

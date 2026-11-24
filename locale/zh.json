@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "dsh-conversation-archive",
+    "title": "dsh-plugin-conversation-archive",
     "description": "把每次对话生成的文件归入工作目录下的 <日期>_<主题> 文件夹，而不是散落在根目录。",
     "detail": "docs/DETAIL.md"
   }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-conversation-archive",
-  "version": "1.0.2",
-  "description": "Put every conversation's output files into one <date>_<topic> folder inside the workspace.",
+  "version": "1.0.3",
+  "description": "把每次对话的产出文件归入工作区里一个 <日期>_<主题> 文件夹，而不是散落在根目录。",
   "type": "module",
   "exports": {
     ".": "./index.js",

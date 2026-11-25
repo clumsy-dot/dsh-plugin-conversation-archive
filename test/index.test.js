@@ -67,8 +67,36 @@ function createFileSystem(initial = {}) {
 }
 
 /**
+ * A subprocess stand-in that records the argv it was asked to run.
+ * @returns the fake service plus its call log.
+ */
+function createSubprocess() {
+  const calls = []
+  return {
+    calls,
+    async terminalEnvironment() {
+      return { platform: process.platform === 'win32' ? 'windows' : 'posix' }
+    },
+    async resolveExecutable(command) {
+      return command
+    },
+    spawn(spec) {
+      calls.push(spec.argv)
+      return {
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        collected: {},
+        stdin: undefined,
+        stdout: undefined,
+        stderr: undefined,
+      }
+    },
+  }
+}
+
+/**
  * Build a fake Harness context for one plugin instance.
- * @param {{ config?: object, files?: Record<string, object>, firstPrompt?: string }} options - initial state.
+ * @param {{ config?: object, files?: Record<string, object>, firstPrompt?: string, services?: object }} options - initial state.
  * @returns the harness: the fake agent, captured registrations, and helpers.
  */
 function createHarness(options = {}) {
@@ -90,7 +118,7 @@ function createHarness(options = {}) {
   const ctx = {
     fs,
     workingDirectory: { get: () => ROOT },
-    get: () => undefined,
+    get: name => options.services?.[name],
     systemPrompt: {
       context: definition => {
         promptContext = definition
@@ -127,6 +155,8 @@ function createHarness(options = {}) {
     fire: async (event, payload) => handlers.get(event)?.(payload),
     /** Record a tool result the way the Harness reports one. */
     toolResult: payload => handlers.get('tools/result')?.(payload),
+    /** Deliver a user message carrying attachments. */
+    userMessage: content => handlers.get('session/event')?.(session, { type: 'user/message', data: { content } }),
   }
 }
 
@@ -305,4 +335,72 @@ test('includeSubagents=false leaves subagent sessions alone', async () => {
   h.toolResult({ agent: h.agent, name: 'write', arguments: { file_path: join(ROOT, 'out.txt') } })
   await h.fire('agent/turn-stopping', { agent: h.agent })
   assert.equal(h.moved.length, 0)
+})
+
+test('a file the user attached is copied into the conversation folder', async () => {
+  const subprocess = createSubprocess()
+  const storePath = join(sep, 'store', 'att-1', 'data.csv')
+  const attachments = { fileHostPath: () => storePath }
+  const h = createHarness({ firstPrompt: '整理这份附件', services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'att-1', name: 'data.csv', bytes: 120 } }])
+  // The user attached a file and asked nothing else yet: no tool ran this turn.
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.equal(subprocess.calls.length, 1, 'a copy must run even without other tools')
+  const argv = subprocess.calls[0].join(' ')
+  assert.match(argv, /Copy-Item|cp -f/)
+  assert.ok(argv.includes(join(ROOT, '2026-11-22_整理这份附件', 'data.csv')), argv)
+  assert.match(h.guidance(), /2026-11-22_整理这份附件/, 'copying a user file settles the folder')
+})
+
+test('a second attachment with the same name never overwrites the first', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: ref => join(sep, 'store', ref.attachmentId, 'data.csv') }
+  const h = createHarness({ firstPrompt: '整理附件', services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'a1', name: 'data.csv', bytes: 10 } }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  // The first copy now exists in the folder, so the second needs another name.
+  h.files.set(join(ROOT, '2026-11-22_整理附件'), { type: 'directory' })
+  h.files.set(join(ROOT, '2026-11-22_整理附件', 'data.csv'), { type: 'file', size: 10 })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'a2', name: 'data.csv', bytes: 10 } }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  const argv = subprocess.calls.at(-1).join(' ')
+  assert.ok(argv.includes('data (2).csv'), argv)
+})
+
+test('pasted images stay out unless includeUserImages is on', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { imageHostPath: () => join(sep, 'store', 'img', 'shot.png') }
+  const off = createHarness({ services: { attachments, subprocess } })
+  await off.fire('agent/created', { agent: off.agent })
+  off.userMessage([{ type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 40 } }])
+  await off.fire('agent/turn-stopping', { agent: off.agent })
+  assert.equal(subprocess.calls.length, 0)
+
+  const on = createHarness({ config: { includeUserImages: true }, services: { attachments, subprocess } })
+  await on.fire('agent/created', { agent: on.agent })
+  on.userMessage([{ type: 'image', attachment: { attachmentId: 'img-1', mediaType: 'image/png', bytes: 40 } }])
+  await on.fire('agent/turn-stopping', { agent: on.agent })
+  const argv = subprocess.calls.at(-1).join(' ')
+  assert.ok(argv.includes('image-img-1.png'), argv)
+})
+
+test('an attachment with no local path is reported, not silently dropped', async () => {
+  const h = createHarness({ firstPrompt: '看附件', services: { attachments: {} } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'att-9', name: 'remote.bin', bytes: 5 } }])
+  const result = await h.callTool({ paths: [] })
+  assert.equal(result.copied.length, 0)
+  assert.ok(result.skipped.some(entry => entry.reason.includes('不在本机存储')))
+})
+
+test('includeUserFiles=false ignores user attachments entirely', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: () => join(sep, 'store', 'a1', 'x.txt') }
+  const h = createHarness({ config: { includeUserFiles: false }, services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'a1', name: 'x.txt', bytes: 3 } }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.equal(subprocess.calls.length, 0)
 })

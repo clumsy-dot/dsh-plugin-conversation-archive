@@ -43,6 +43,7 @@ const DEFAULTS = {
   turnEndBudgetMs: 8000,
   includeSubagents: true,
   includeUserFiles: true,
+  includeReferencedFiles: true,
   includeUserImages: false,
   userFileTransfer: 'copy',
   maxUserCopyBytes: 20 * 1024 * 1024,
@@ -95,6 +96,7 @@ function resolveConfig(raw, warn) {
   pick('skipDotEntries', isBool)
   pick('includeSubagents', isBool)
   pick('includeUserFiles', isBool)
+  pick('includeReferencedFiles', isBool)
   pick('includeUserImages', isBool)
   pick('userFileTransfer', value => value === 'move' || value === 'copy')
   pick('baseDir', isString)
@@ -226,6 +228,26 @@ function attachmentsIn(message, includeImages) {
         ? attachment.name.trim()
         : `image-${String(attachment.attachmentId ?? '').slice(0, 8)}.${extension}`
       found.push({ kind: 'image', ref: attachment, name })
+    }
+  }
+  return found
+}
+
+/**
+ * Collect the paths a message references as `@path` mentions, which is how a
+ * user hands over a file that lives outside the workspace.
+ * @param message - a `user/message` payload.
+ * @returns the raw path strings, in order.
+ */
+function referencedPaths(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const found = []
+  for (const block of content) {
+    if (block === null || typeof block !== 'object' || block.type !== 'text' || typeof block.text !== 'string') continue
+    for (const match of block.text.matchAll(/@(?:"([^"\n]+)"|([^\s"@]+))/gu)) {
+      const raw = (match[1] ?? match[2] ?? '').trim().replace(/[.,;:!?、，。；：！？)）\]】]+$/gu, '')
+      if (raw.length > 0) found.push(raw)
     }
   }
   return found
@@ -563,16 +585,28 @@ export function apply(ctx, rawConfig) {
       }
       // Images are re-read by the Harness through the attachment store, so they
       // are always copied; a text/file attachment is re-read by path, and the
-      // prompt tells the model where it went, so it may travel as a move.
-      const mode = item.kind === 'image' || opts.userFileTransfer === 'copy' ? 'copy' : 'move'
+      // prompt tells the model where it went, so it may travel as a move. A file
+      // the user merely referenced stays where it is and is only ever copied.
+      const mode = item.kind === 'path' || item.kind === 'image' || opts.userFileTransfer === 'copy' ? 'copy' : 'move'
       const verb = mode === 'copy' ? '复制' : '移动'
       try {
-        if (attachments === undefined || attachments === null) throw new Error(`当前组合没有 attachments 服务，无法${verb}用户文件`)
-        const hostPath = item.kind === 'image'
-          ? attachments.imageHostPath?.(item.ref)
-          : attachments.fileHostPath?.(item.ref)
+        let hostPath
+        if (item.kind === 'path') {
+          const info = await ctx.fs.stat(await ctx.fs.resolve(item.sourcePath))
+          // A mention that no longer points at a file is not worth reporting.
+          if (info === undefined || info.type !== 'file') {
+            item.done = true
+            continue
+          }
+          hostPath = item.sourcePath
+        } else {
+          if (attachments === undefined || attachments === null) throw new Error(`当前组合没有 attachments 服务，无法${verb}用户文件`)
+          hostPath = item.kind === 'image'
+            ? attachments.imageHostPath?.(item.ref)
+            : attachments.fileHostPath?.(item.ref)
+        }
         if (typeof hostPath !== 'string' || hostPath.length === 0) throw new Error(`该附件不在本机存储里，无法${verb}`)
-        const bytes = typeof item.ref.bytes === 'number' ? item.ref.bytes : 0
+        const bytes = typeof item.ref?.bytes === 'number' ? item.ref.bytes : 0
         if (bytes > opts.maxUserCopyBytes) throw new Error(`附件 ${bytes} 字节，超过 maxUserCopyBytes=${opts.maxUserCopyBytes}`)
         const destination = await freeDestination(directory, item.name)
         await shellTransfer(hostPath, destination, mode)
@@ -837,7 +871,7 @@ export function apply(ctx, rawConfig) {
           `${path}${sep}`,
           `- 你为用户产出的文件（文档、表格、图片、脚本、压缩包等）一律写到上面这个目录，引用时用 \`${settled}${sep}文件名\`；不要在 ${base} 根目录堆积新文件，也不要另建并列的顶层目录。`,
           '- 项目源码、仓库文件照旧留在它们自己的目录里，这条约定只管你新产出的交付文件。',
-          `- 用户发给你的附件会被放进这个目录：文件类默认${opts.userFileTransfer === 'copy' ? '复制副本' : '搬入'}、图片类保留副本；要再看内容就按目录里的路径读。`,
+          `- 用户发给你的附件、以及消息里 @ 引用的外部文件，都会放进这个目录（复制${opts.userFileTransfer === 'move' ? '；文件类附件改成搬移' : ''}）；要再看内容就按目录里的路径读。`,
           '- 临时中间文件放系统临时目录，不要留在工作区。',
           '- 结束前如果工作区根目录还有本次新生成的文件，先调用 archive_outputs 把它们归拢进去。',
         ]
@@ -972,7 +1006,7 @@ export function apply(ctx, rawConfig) {
     try {
       const state = stateOf(agent)
       state.dirty = false
-      seedAttachments(agent.session)
+      seedUserFiles(agent.session, baseDirOf(agent))
       const baseline = await ensureBaseline(agent, state)
       if (baseline.names === null) warn(`记录目录基线失败：${baseline.reason}`)
     } catch (error) {
@@ -1015,12 +1049,25 @@ export function apply(ctx, rawConfig) {
   })
 
   /**
-   * Remember the attachments of one user message, once each.
+   * Remember the files one user message hands over: chat attachments and
+   * `@path` references to files outside the workspace, once each.
    * @param session - the conversation the message belongs to.
    * @param message - the `user/message` payload.
+   * @param base - the session working directory, for resolving relative mentions.
    */
-  function recordAttachments(session, message) {
-    const found = attachmentsIn(message, opts.includeUserImages)
+  function recordUserFiles(session, message, base) {
+    const found = []
+    if (opts.includeUserFiles) found.push(...attachmentsIn(message, opts.includeUserImages))
+    if (opts.includeReferencedFiles) {
+      for (const raw of referencedPaths(message)) {
+        const absolute = isAbsolute(raw) ? raw : resolve(base, raw)
+        const inside = relative(base, absolute)
+        // A file already in the workspace needs no copy; it is either swept from the
+        // root or belongs to the project the conversation is working on.
+        if (inside.length === 0 || (!inside.startsWith('..') && !isAbsolute(inside))) continue
+        found.push({ kind: 'path', ref: null, sourcePath: absolute, name: basename(absolute) })
+      }
+    }
     if (found.length === 0) return
     let recorded = sessionAttachments.get(session.id)
     if (recorded === undefined) {
@@ -1032,7 +1079,7 @@ export function apply(ctx, rawConfig) {
       }
     }
     for (const item of found) {
-      const id = String(item.ref?.attachmentId ?? '')
+      const id = item.kind === 'path' ? `path:${item.sourcePath}` : String(item.ref?.attachmentId ?? '')
       if (id.length === 0 || recorded.has(id)) continue
       recorded.set(id, { ...item, done: false })
       if (recorded.size > 50) {
@@ -1043,23 +1090,24 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Re-read the attachments already in the session log, so a conversation
-   * resumed or a plugin reloaded mid-way still gets its files archived.
+   * Re-read the user files already in the session log, so a conversation
+   * resumed or a plugin reloaded mid-way still gets them archived.
    * @param session - the session to scan.
+   * @param base - the session working directory.
    */
-  function seedAttachments(session) {
-    if (!opts.includeUserFiles) return
+  function seedUserFiles(session, base) {
+    if (!opts.includeUserFiles && !opts.includeReferencedFiles) return
     const events = session.snapshotEvents?.() ?? []
     for (const event of events) {
-      if (event?.type === 'user/message') recordAttachments(session, event.data)
+      if (event?.type === 'user/message') recordUserFiles(session, event.data, base)
     }
   }
 
   ctx.on('session/event', (session, event) => {
-    if (!opts.enabled || !opts.includeUserFiles) return
+    if (!opts.enabled || (!opts.includeUserFiles && !opts.includeReferencedFiles)) return
     if (event?.type !== 'user/message') return
     try {
-      recordAttachments(session, event.data)
+      recordUserFiles(session, event.data, sessionDirectory(ctx.workingDirectory, session))
     } catch {
       /* attachment tracking is best effort */
     }

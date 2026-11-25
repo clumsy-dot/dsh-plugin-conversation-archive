@@ -470,3 +470,39 @@ test('an explicit copy mode reports action copy and keeps the original', async (
   assert.equal(result.userFiles[0].action, 'copy')
   assert.match(subprocess.calls[0].join(' '), /Copy-Item|cp -f/)
 })
+
+test('a file the user references with @path outside the workspace is copied in', async () => {
+  const subprocess = createSubprocess()
+  const outside = process.platform === 'win32' ? `C:${sep}dl${sep}通知.pdf` : '/dl/通知.pdf'
+  const h = createHarness({ firstPrompt: '看这份通知', services: { subprocess } })
+  h.files.set(outside, { type: 'file', size: 2048 })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'text', text: `@${outside} 帮我做个选题对比` }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.equal(subprocess.calls.length, 1, 'a referenced file must be copied')
+  const argv = subprocess.calls[0].join(' ')
+  assert.match(argv, /Copy-Item|cp -f/)
+  assert.ok(argv.includes(join(ROOT, '2026-11-22_看这份通知', '通知.pdf')), argv)
+  assert.match(h.guidance(), /通知\.pdf → 2026-11-22_看这份通知\/通知\.pdf/)
+})
+
+test('a referenced path inside the workspace is not copied again', async () => {
+  const subprocess = createSubprocess()
+  const h = createHarness({ firstPrompt: '看代码', services: { subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'text', text: '@src/index.ts 这里有问题' }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.equal(subprocess.calls.length, 0)
+})
+
+test('a referenced path that does not exist is ignored silently', async () => {
+  const subprocess = createSubprocess()
+  const missing = process.platform === 'win32' ? `C:${sep}dl${sep}gone.pdf` : '/dl/gone.pdf'
+  const h = createHarness({ firstPrompt: '看附件', services: { subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'text', text: `@${missing}` }])
+  const result = await h.callTool({ paths: [] })
+  assert.equal(subprocess.calls.length, 0)
+  assert.equal(result.userFiles.length, 0)
+  assert.equal(result.skipped.length, 0)
+})

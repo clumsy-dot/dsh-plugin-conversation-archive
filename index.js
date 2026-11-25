@@ -952,6 +952,7 @@ export function apply(ctx, rawConfig) {
     try {
       const state = stateOf(agent)
       state.dirty = false
+      seedAttachments(agent.session)
       const baseline = await ensureBaseline(agent, state)
       if (baseline.names === null) warn(`记录目录基线失败：${baseline.reason}`)
     } catch (error) {
@@ -993,30 +994,52 @@ export function apply(ctx, rawConfig) {
     }
   })
 
+  /**
+   * Remember the attachments of one user message, once each.
+   * @param session - the conversation the message belongs to.
+   * @param message - the `user/message` payload.
+   */
+  function recordAttachments(session, message) {
+    const found = attachmentsIn(message, opts.includeUserImages)
+    if (found.length === 0) return
+    let recorded = sessionAttachments.get(session.id)
+    if (recorded === undefined) {
+      recorded = new Map()
+      sessionAttachments.set(session.id, recorded)
+      if (sessionAttachments.size > 256) {
+        const oldest = sessionAttachments.keys().next().value
+        if (oldest !== undefined) sessionAttachments.delete(oldest)
+      }
+    }
+    for (const item of found) {
+      const id = String(item.ref?.attachmentId ?? '')
+      if (id.length === 0 || recorded.has(id)) continue
+      recorded.set(id, { ...item, copied: false })
+      if (recorded.size > 50) {
+        const oldest = recorded.keys().next().value
+        if (oldest !== undefined) recorded.delete(oldest)
+      }
+    }
+  }
+
+  /**
+   * Re-read the attachments already in the session log, so a conversation
+   * resumed or a plugin reloaded mid-way still gets its files archived.
+   * @param session - the session to scan.
+   */
+  function seedAttachments(session) {
+    if (!opts.includeUserFiles) return
+    const events = session.snapshotEvents?.() ?? []
+    for (const event of events) {
+      if (event?.type === 'user/message') recordAttachments(session, event.data)
+    }
+  }
+
   ctx.on('session/event', (session, event) => {
     if (!opts.enabled || !opts.includeUserFiles) return
     if (event?.type !== 'user/message') return
     try {
-      const found = attachmentsIn(event.data, opts.includeUserImages)
-      if (found.length === 0) return
-      let recorded = sessionAttachments.get(session.id)
-      if (recorded === undefined) {
-        recorded = new Map()
-        sessionAttachments.set(session.id, recorded)
-        if (sessionAttachments.size > 256) {
-          const oldest = sessionAttachments.keys().next().value
-          if (oldest !== undefined) sessionAttachments.delete(oldest)
-        }
-      }
-      for (const item of found) {
-        const id = String(item.ref?.attachmentId ?? '')
-        if (id.length === 0 || recorded.has(id)) continue
-        recorded.set(id, { ...item, copied: false })
-        if (recorded.size > 50) {
-          const oldest = recorded.keys().next().value
-          if (oldest !== undefined) recorded.delete(oldest)
-        }
-      }
+      recordAttachments(session, event.data)
     } catch {
       /* attachment tracking is best effort */
     }

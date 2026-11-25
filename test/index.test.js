@@ -109,9 +109,12 @@ function createHarness(options = {}) {
   const session = {
     id: SESSION_ID,
     header: { createdAt: CREATED_AT, cwd: ROOT },
-    snapshotEvents: () => (options.firstPrompt === undefined
-      ? []
-      : [{ type: 'user/message', data: { content: [{ type: 'text', text: options.firstPrompt }] } }]),
+    snapshotEvents: () => {
+      if (Array.isArray(options.events)) return options.events
+      return options.firstPrompt === undefined
+        ? []
+        : [{ type: 'user/message', data: { content: [{ type: 'text', text: options.firstPrompt }] } }]
+    },
   }
   const agent = { id: SESSION_ID, session }
 
@@ -403,4 +406,21 @@ test('includeUserFiles=false ignores user attachments entirely', async () => {
   h.userMessage([{ type: 'file', attachment: { attachmentId: 'a1', name: 'x.txt', bytes: 3 } }])
   await h.fire('agent/turn-stopping', { agent: h.agent })
   assert.equal(subprocess.calls.length, 0)
+})
+
+test('attachments already in the session log are archived after a reload', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: ref => join(sep, 'store', ref.attachmentId, 'old.csv') }
+  const h = createHarness({
+    services: { attachments, subprocess },
+    events: [
+      { type: 'user/message', data: { content: [{ type: 'text', text: '看这个附件' }] } },
+      { type: 'user/message', data: { content: [{ type: 'file', attachment: { attachmentId: 'old-1', name: 'old.csv', bytes: 8 } }] } },
+    ],
+  })
+  // A reloaded plugin re-reads the log when the agent is created.
+  await h.fire('agent/created', { agent: h.agent })
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.equal(subprocess.calls.length, 1)
+  assert.ok(subprocess.calls[0].join(' ').includes('old.csv'))
 })

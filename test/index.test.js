@@ -340,7 +340,7 @@ test('includeSubagents=false leaves subagent sessions alone', async () => {
   assert.equal(h.moved.length, 0)
 })
 
-test('a file the user attached is moved into the conversation folder', async () => {
+test('a file the user attached is copied into the conversation folder by default', async () => {
   const subprocess = createSubprocess()
   const storePath = join(sep, 'store', 'att-1', 'data.csv')
   const attachments = { fileHostPath: () => storePath }
@@ -351,9 +351,20 @@ test('a file the user attached is moved into the conversation folder', async () 
   await h.fire('agent/turn-stopping', { agent: h.agent })
   assert.equal(subprocess.calls.length, 1, 'the transfer must run even without other tools')
   const argv = subprocess.calls[0].join(' ')
-  assert.match(argv, /Move-Item|mv -f/, 'the default is a move, not a copy')
+  assert.match(argv, /Copy-Item|cp -f/, 'the default keeps the original attachment')
   assert.ok(argv.includes(join(ROOT, '2026-11-22_整理这份附件', 'data.csv')), argv)
-  assert.match(h.guidance(), /2026-11-22_整理这份附件/, 'copying a user file settles the folder')
+  assert.match(h.guidance(), /2026-11-22_整理这份附件/, 'handling a user file settles the folder')
+})
+
+test('userFileTransfer=move moves the file and the prompt records the new path', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: () => join(sep, 'store', 'mv', 'spec.pdf') }
+  const h = createHarness({ config: { userFileTransfer: 'move' }, firstPrompt: '看图纸', services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'm1', name: 'spec.pdf', bytes: 9 } }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  assert.match(subprocess.calls[0].join(' '), /Move-Item|mv -f/)
+  assert.match(h.guidance(), /spec\.pdf → 2026-11-22_看图纸\/spec\.pdf/)
 })
 
 test('a second attachment with the same name never overwrites the first', async () => {
@@ -446,10 +457,10 @@ test('the tool result reports the transfer action and destination', async () => 
   await h.fire('agent/created', { agent: h.agent })
   h.userMessage([{ type: 'file', attachment: { attachmentId: 'a', name: 'a.txt', bytes: 3 } }])
   const result = await h.callTool({ paths: [] })
-  assert.deepEqual(result.userFiles, [{ from: 'a.txt', to: '2026-11-22_附件/a.txt', action: 'move' }])
+  assert.deepEqual(result.userFiles, [{ from: 'a.txt', to: '2026-11-22_附件/a.txt', action: 'copy' }])
 })
 
-test('userFileTransfer=copy keeps the attachment in the session store', async () => {
+test('an explicit copy mode reports action copy and keeps the original', async () => {
   const subprocess = createSubprocess()
   const attachments = { fileHostPath: () => join(sep, 'store', 'y', 'keep.txt') }
   const h = createHarness({ config: { userFileTransfer: 'copy' }, services: { attachments, subprocess } })

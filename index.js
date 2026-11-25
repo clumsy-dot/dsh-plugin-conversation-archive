@@ -44,7 +44,7 @@ const DEFAULTS = {
   includeSubagents: true,
   includeUserFiles: true,
   includeUserImages: false,
-  userFileTransfer: 'move',
+  userFileTransfer: 'copy',
   maxUserCopyBytes: 20 * 1024 * 1024,
 }
 

@@ -1,5 +1,7 @@
 # dsh-plugin-conversation-archive
 
+[![test](https://github.com/clumsy-dot/dsh-plugin-conversation-archive/actions/workflows/test.yml/badge.svg)](https://github.com/clumsy-dot/dsh-plugin-conversation-archive/actions/workflows/test.yml)
+
 把每次对话生成的文件收进工作目录下的一个文件夹，而不是散落在根目录：
 
 ```
@@ -14,7 +16,7 @@
 ## 它怎么工作
 
 1. **先约定**：插件给每个会话的系统提示词加一段「本次对话的产物目录」，要求模型把交付文件放进工作目录下一个 `日期_主题` 文件夹，主题自己用一句短语概括（如 `题库转换`），不要照抄提问原句，临时文件放系统临时目录。
-2. **认领文件夹**：本对话用文件工具写进去的 `2026-11-22_xxx` 目录会被插件认作本次对话的产物目录；从下一轮起提示词直接给出它的绝对路径，模型不会再换名字，漏在根目录的文件也会归拢进它。别的对话在同一目录下建的文件夹不会被误认。
+2. **认领文件夹**：本对话用**写类工具**（`write`/`edit`/脚本命令等；读取、搜索不算）产出过内容的 `日期_主题` 目录会被插件认作本次对话的产物目录；从下一轮起提示词直接给出它的绝对路径，模型不会再换名字，漏在根目录的文件也会归拢进它。别的对话在同一目录下建的文件夹不会被误认。
 3. **兜底归拢**：对话开始时记录工作目录根层基线；每回合结束把「本回合新出现在根层的新文件」移进该文件夹（完全没有调用工具的回合会跳过扫描）。文本文件用文件服务原子移动，二进制或大文件用系统命令重命名，并带超时。移动失败的文件留到下次重试，不会丢。
 4. **随时可用**：`archive_outputs` 工具让模型主动归拢根目录里漏掉的产物，还能用 `topic` 指定主题让插件来建文件夹。
 
@@ -91,11 +93,11 @@ plugin_manager remove_bundle target=dsh-plugin-conversation-archive
 
 - 无法区分「模型生成的」和「用户在同一回合里放进根目录的」新文件，两者都会被归拢；用 `ignorePatterns` 或关掉 `autoArchive` 规避。
 - 模型若一直不建文件夹且写了根目录文件，兜底会用提示词首句截断出的临时主题建文件夹，名字可能不够好，改个名即可。
-- 用脚本（不经文件工具）写出的产物文件夹不会被认领，此时兜底归拢会另建一个文件夹。
+- 用脚本（不经文件工具）写出的产物文件夹：只要命令里出现了 `日期_主题/…` 这样的路径就能被认领，认不出时兜底归拢会另建一个文件夹。
 - 二进制/大文件依赖 `subprocess` 服务执行系统命令；没有它时这类文件留在原处并在结果里说明。
 - 插件重载后的第一个回合只记录目录基线、不搬文件，之后的回合恢复正常。
 
-## 开发
+## 开发与测试
 
 单文件 Host 插件，无运行时依赖（只用 `node:path`）。构建于 DSH `0.2.2-rc.5`。
 
@@ -105,6 +107,13 @@ cordis.patch.yml  bundle 行
 locale/*.json     Plugins 里的标题与说明
 docs/DETAIL.md    插件详情页
 icon.svg          图标
+test/             行为测试
 ```
+
+```
+npm test          # 等价于 node --test test/index.test.js
+```
+
+测试用假的 Harness `ctx`（内存文件系统 + 假 Session）直接驱动插件注册的那三处：提示词段落、`archive_outputs` 工具、`agent/created` / `tools/result` / `agent/turn-stopping` 处理器，不碰真实磁盘和真实会话。CI 在 Node 22/24 上跑同一套测试。
 
 MIT License。

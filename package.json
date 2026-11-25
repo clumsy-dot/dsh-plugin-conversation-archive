@@ -1,8 +1,11 @@
 {
   "name": "dsh-plugin-conversation-archive",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "把每次对话的产出文件归入工作区里一个 <日期>_<主题> 文件夹，而不是散落在根目录。",
   "type": "module",
+  "scripts": {
+    "test": "node --test test/index.test.js"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",

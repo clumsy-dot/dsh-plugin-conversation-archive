@@ -53,6 +53,13 @@ const DATED_FOLDER = /^\d{4}-\d{2}-\d{2}_./u
 /** Keys under which a tool call names the file it targets. */
 const PATH_KEYS = /^(?:file_?path|path|file|target|destination|output_?path|dst|src)$/iu
 
+/**
+ * Tools that can create output. Only these count towards owning a folder:
+ * reading, searching, or listing another conversation's folder must not make
+ * this conversation adopt it.
+ */
+const WRITER_TOOL = /write|edit|patch|create|save|export|generate|convert|render|office|sheet|doc|pdf|bash|pwsh|shell|terminal|exec|run|script|code|apply/iu
+
 /** Openers that carry no summarizing value once the topic is truncated. */
 const FILLER_OPENER = /^(?:请|麻烦|帮我|帮忙|给我|我想|我想要|我需要|能不能|可以|希望|做一个|写一个|搞一个|弄一个)+/u
 
@@ -850,6 +857,10 @@ export function apply(ctx, rawConfig) {
       const state = stateOf(agent)
       // Any tool ran, so this turn may have produced output in the root.
       state.dirty = true
+      // Ownership only follows tools that can create files; a read of another
+      // conversation's folder must not claim it.
+      const name = typeof exec.name === 'string' ? exec.name : ''
+      if (!WRITER_TOOL.test(name)) return
       const base = baseDirOf(agent)
       for (const raw of pathValues(exec.arguments)) {
         const relativePath = relative(base, isAbsolute(raw) ? raw : resolve(base, raw))

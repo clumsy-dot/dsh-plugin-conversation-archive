@@ -408,6 +408,7 @@ export function apply(ctx, rawConfig) {
       mentions: new Set(),
       dirty: false,
       moved: [],
+      userFiles: [],
       busy: false,
     }
     states.set(agent.id, state)
@@ -553,7 +554,6 @@ export function apply(ctx, rawConfig) {
     if (pending.length === 0) return
     const attachments = ctx.get('attachments')
     const directory = join(base, folder)
-    const verb = opts.userFileTransfer === 'copy' ? '复制' : '移动'
     // A user file is reason enough to settle the folder name.
     if (settledFolder(state) === null) state.frozen = true
     for (const item of pending) {
@@ -561,6 +561,11 @@ export function apply(ctx, rawConfig) {
         result.skipped.push({ path: item.name, reason: '超出时间预算，下一次归拢重试' })
         continue
       }
+      // Images are re-read by the Harness through the attachment store, so they
+      // are always copied; a text/file attachment is re-read by path, and the
+      // prompt tells the model where it went, so it may travel as a move.
+      const mode = item.kind === 'image' || opts.userFileTransfer === 'copy' ? 'copy' : 'move'
+      const verb = mode === 'copy' ? '复制' : '移动'
       try {
         if (attachments === undefined || attachments === null) throw new Error(`当前组合没有 attachments 服务，无法${verb}用户文件`)
         const hostPath = item.kind === 'image'
@@ -570,9 +575,12 @@ export function apply(ctx, rawConfig) {
         const bytes = typeof item.ref.bytes === 'number' ? item.ref.bytes : 0
         if (bytes > opts.maxUserCopyBytes) throw new Error(`附件 ${bytes} 字节，超过 maxUserCopyBytes=${opts.maxUserCopyBytes}`)
         const destination = await freeDestination(directory, item.name)
-        await shellTransfer(hostPath, destination, opts.userFileTransfer === 'copy' ? 'copy' : 'move')
+        await shellTransfer(hostPath, destination, mode)
         item.done = true
-        result.userFiles.push({ from: item.name, to: `${folder}/${basename(destination)}`, action: opts.userFileTransfer === 'copy' ? 'copy' : 'move' })
+        const entry = { from: item.name, to: `${folder}/${basename(destination)}`, action: mode }
+        result.userFiles.push(entry)
+        state.userFiles.push(entry)
+        if (state.userFiles.length > 40) state.userFiles.splice(0, state.userFiles.length - 40)
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
         result.skipped.push({ path: item.name, reason })
@@ -829,13 +837,17 @@ export function apply(ctx, rawConfig) {
           `${path}${sep}`,
           `- 你为用户产出的文件（文档、表格、图片、脚本、压缩包等）一律写到上面这个目录，引用时用 \`${settled}${sep}文件名\`；不要在 ${base} 根目录堆积新文件，也不要另建并列的顶层目录。`,
           '- 项目源码、仓库文件照旧留在它们自己的目录里，这条约定只管你新产出的交付文件。',
-          `- 用户发给你的文件会被${opts.userFileTransfer === 'copy' ? '复制' : '搬'}进这个目录${opts.userFileTransfer === 'copy' ? '' : '（原附件不再留在会话里）'}，直接引用目录里的文件即可。`,
+          `- 用户发给你的附件会被放进这个目录：文件类默认${opts.userFileTransfer === 'copy' ? '复制副本' : '搬入'}、图片类保留副本；要再看内容就按目录里的路径读。`,
           '- 临时中间文件放系统临时目录，不要留在工作区。',
           '- 结束前如果工作区根目录还有本次新生成的文件，先调用 archive_outputs 把它们归拢进去。',
         ]
         if (state.moved.length > 0) {
           lines.push('- 已归拢到该目录：')
           for (const entry of state.moved.slice(-10)) lines.push(`  - ${entry.from} → ${entry.to}`)
+        }
+        if (state.userFiles.length > 0) {
+          lines.push('- 用户提供的文件也在该目录（要再看内容就按这里的路径读）：')
+          for (const entry of state.userFiles.slice(-10)) lines.push(`  - ${entry.from} → ${entry.to}${entry.action === 'copy' ? '（副本，原附件仍在）' : ''}`)
         }
         return lines.join('\n')
       }

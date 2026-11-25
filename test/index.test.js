@@ -387,6 +387,20 @@ test('pasted images stay out unless includeUserImages is on', async () => {
   await on.fire('agent/turn-stopping', { agent: on.agent })
   const argv = subprocess.calls.at(-1).join(' ')
   assert.ok(argv.includes('image-img-1.png'), argv)
+  // Images are re-read by the Harness through the store, so they are never moved.
+  assert.match(argv, /Copy-Item|cp -f/, 'an image must be copied even in move mode')
+})
+
+test('the prompt tells the model where a moved attachment now lives', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: () => join(sep, 'store', 'z', 'spec.pdf') }
+  const h = createHarness({ firstPrompt: '看这份图纸', services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'f1', name: 'spec.pdf', bytes: 9 } }])
+  await h.fire('agent/turn-stopping', { agent: h.agent })
+  const text = h.guidance()
+  assert.match(text, /用户提供的文件也在该目录/)
+  assert.match(text, /spec\.pdf → 2026-11-22_看这份图纸\/spec\.pdf/)
 })
 
 test('an attachment with no local path is reported, not silently dropped', async () => {

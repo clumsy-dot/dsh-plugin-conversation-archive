@@ -340,7 +340,7 @@ test('includeSubagents=false leaves subagent sessions alone', async () => {
   assert.equal(h.moved.length, 0)
 })
 
-test('a file the user attached is copied into the conversation folder', async () => {
+test('a file the user attached is moved into the conversation folder', async () => {
   const subprocess = createSubprocess()
   const storePath = join(sep, 'store', 'att-1', 'data.csv')
   const attachments = { fileHostPath: () => storePath }
@@ -349,9 +349,9 @@ test('a file the user attached is copied into the conversation folder', async ()
   h.userMessage([{ type: 'file', attachment: { attachmentId: 'att-1', name: 'data.csv', bytes: 120 } }])
   // The user attached a file and asked nothing else yet: no tool ran this turn.
   await h.fire('agent/turn-stopping', { agent: h.agent })
-  assert.equal(subprocess.calls.length, 1, 'a copy must run even without other tools')
+  assert.equal(subprocess.calls.length, 1, 'the transfer must run even without other tools')
   const argv = subprocess.calls[0].join(' ')
-  assert.match(argv, /Copy-Item|cp -f/)
+  assert.match(argv, /Move-Item|mv -f/, 'the default is a move, not a copy')
   assert.ok(argv.includes(join(ROOT, '2026-11-22_整理这份附件', 'data.csv')), argv)
   assert.match(h.guidance(), /2026-11-22_整理这份附件/, 'copying a user file settles the folder')
 })
@@ -394,7 +394,7 @@ test('an attachment with no local path is reported, not silently dropped', async
   await h.fire('agent/created', { agent: h.agent })
   h.userMessage([{ type: 'file', attachment: { attachmentId: 'att-9', name: 'remote.bin', bytes: 5 } }])
   const result = await h.callTool({ paths: [] })
-  assert.equal(result.copied.length, 0)
+  assert.equal(result.userFiles.length, 0)
   assert.ok(result.skipped.some(entry => entry.reason.includes('不在本机存储')))
 })
 
@@ -423,4 +423,25 @@ test('attachments already in the session log are archived after a reload', async
   await h.fire('agent/turn-stopping', { agent: h.agent })
   assert.equal(subprocess.calls.length, 1)
   assert.ok(subprocess.calls[0].join(' ').includes('old.csv'))
+})
+
+test('the tool result reports the transfer action and destination', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: () => join(sep, 'store', 'x', 'a.txt') }
+  const h = createHarness({ firstPrompt: '附件', services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'a', name: 'a.txt', bytes: 3 } }])
+  const result = await h.callTool({ paths: [] })
+  assert.deepEqual(result.userFiles, [{ from: 'a.txt', to: '2026-11-22_附件/a.txt', action: 'move' }])
+})
+
+test('userFileTransfer=copy keeps the attachment in the session store', async () => {
+  const subprocess = createSubprocess()
+  const attachments = { fileHostPath: () => join(sep, 'store', 'y', 'keep.txt') }
+  const h = createHarness({ config: { userFileTransfer: 'copy' }, services: { attachments, subprocess } })
+  await h.fire('agent/created', { agent: h.agent })
+  h.userMessage([{ type: 'file', attachment: { attachmentId: 'k', name: 'keep.txt', bytes: 3 } }])
+  const result = await h.callTool({ paths: [] })
+  assert.equal(result.userFiles[0].action, 'copy')
+  assert.match(subprocess.calls[0].join(' '), /Copy-Item|cp -f/)
 })

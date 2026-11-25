@@ -44,6 +44,7 @@ const DEFAULTS = {
   includeSubagents: true,
   includeUserFiles: true,
   includeUserImages: false,
+  userFileTransfer: 'move',
   maxUserCopyBytes: 20 * 1024 * 1024,
 }
 
@@ -95,6 +96,7 @@ function resolveConfig(raw, warn) {
   pick('includeSubagents', isBool)
   pick('includeUserFiles', isBool)
   pick('includeUserImages', isBool)
+  pick('userFileTransfer', value => value === 'move' || value === 'copy')
   pick('baseDir', isString)
   pick('maxUserCopyBytes', isNumber, value => Math.floor(value))
   pick('topicMaxChars', value => isNumber(value) && value >= 1, value => Math.floor(value))
@@ -533,8 +535,9 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Copy the files the user attached to this conversation into its folder, so the
-   * folder holds both what the model produced and what the user handed over.
+   * Move (or copy, when configured) the files the user attached to this
+   * conversation into its folder, so the folder holds both what the model
+   * produced and what the user handed over.
    * @param agent - the agent whose conversation is being served.
    * @param state - its state record.
    * @param base - absolute working directory.
@@ -542,14 +545,15 @@ export function apply(ctx, rawConfig) {
    * @param result - the sweep result to fill.
    * @param started - sweep start time, for the shared budget.
    */
-  async function copyUserFiles(agent, state, base, folder, result, started) {
+  async function transferUserFiles(agent, state, base, folder, result, started) {
     if (!opts.includeUserFiles) return
     const recorded = sessionAttachments.get(agent.id)
     if (recorded === undefined || recorded.size === 0) return
-    const pending = [...recorded.values()].filter(item => !item.copied)
+    const pending = [...recorded.values()].filter(item => !item.done)
     if (pending.length === 0) return
     const attachments = ctx.get('attachments')
     const directory = join(base, folder)
+    const verb = opts.userFileTransfer === 'copy' ? '复制' : '移动'
     // A user file is reason enough to settle the folder name.
     if (settledFolder(state) === null) state.frozen = true
     for (const item of pending) {
@@ -558,21 +562,21 @@ export function apply(ctx, rawConfig) {
         continue
       }
       try {
-        if (attachments === undefined || attachments === null) throw new Error('当前组合没有 attachments 服务，无法复制用户文件')
+        if (attachments === undefined || attachments === null) throw new Error(`当前组合没有 attachments 服务，无法${verb}用户文件`)
         const hostPath = item.kind === 'image'
           ? attachments.imageHostPath?.(item.ref)
           : attachments.fileHostPath?.(item.ref)
-        if (typeof hostPath !== 'string' || hostPath.length === 0) throw new Error('该附件不在本机存储里，无法复制')
+        if (typeof hostPath !== 'string' || hostPath.length === 0) throw new Error(`该附件不在本机存储里，无法${verb}`)
         const bytes = typeof item.ref.bytes === 'number' ? item.ref.bytes : 0
         if (bytes > opts.maxUserCopyBytes) throw new Error(`附件 ${bytes} 字节，超过 maxUserCopyBytes=${opts.maxUserCopyBytes}`)
         const destination = await freeDestination(directory, item.name)
-        await shellTransfer(hostPath, destination, 'copy')
-        item.copied = true
-        result.copied.push({ from: item.name, to: `${folder}/${basename(destination)}` })
+        await shellTransfer(hostPath, destination, opts.userFileTransfer === 'copy' ? 'copy' : 'move')
+        item.done = true
+        result.userFiles.push({ from: item.name, to: `${folder}/${basename(destination)}`, action: opts.userFileTransfer === 'copy' ? 'copy' : 'move' })
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
         result.skipped.push({ path: item.name, reason })
-        warn(`复制用户提供的文件 ${item.name} 失败：${reason}`)
+        warn(`${verb}用户提供的文件 ${item.name} 失败：${reason}`)
       }
     }
   }
@@ -678,7 +682,7 @@ export function apply(ctx, rawConfig) {
     const explicit = Array.isArray(request.paths) ? request.paths : null
     const requestedTopic = typeof request.topic === 'string' ? request.topic.trim() : ''
     const base = baseDirOf(agent)
-    const result = { folder: join(base, folderOf(agent, state)), moved: [], copied: [], skipped: [] }
+    const result = { folder: join(base, folderOf(agent, state)), moved: [], userFiles: [], skipped: [] }
     if (state.busy) {
       result.skipped.push({ path: '*', reason: '一次归拢还没结束' })
       return result
@@ -692,7 +696,7 @@ export function apply(ctx, rawConfig) {
     }
     // Files the user attached must reach the folder even in a turn that ran no
     // tool, so a pending copy also earns the directory walk.
-    const pendingUserFiles = opts.includeUserFiles && [...(sessionAttachments.get(agent.id)?.values() ?? [])].some(item => !item.copied)
+    const pendingUserFiles = opts.includeUserFiles && [...(sessionAttachments.get(agent.id)?.values() ?? [])].some(item => !item.done)
     // A turn that ran no tool cannot have produced conversation output, so the
     // per-turn directory walk is skipped for pure-conversation turns.
     if (explicit === null && !state.dirty && !pendingUserFiles) return result
@@ -708,7 +712,7 @@ export function apply(ctx, rawConfig) {
       if (isFirstObservation) {
         const firstFolder = folderOf(agent, state)
         result.folder = join(base, firstFolder)
-        await copyUserFiles(agent, state, base, firstFolder, result, started)
+        await transferUserFiles(agent, state, base, firstFolder, result, started)
         result.skipped.push({ path: '*', reason: '本轮只记录了目录基线，下一次归拢起生效' })
         return result
       }
@@ -723,7 +727,7 @@ export function apply(ctx, rawConfig) {
       adoptDatedFolder(state, entries, baseline.names)
       const folder = folderOf(agent, state)
       result.folder = join(base, folder)
-      await copyUserFiles(agent, state, base, folder, result, started)
+      await transferUserFiles(agent, state, base, folder, result, started)
       const byName = new Map(entries.map(entry => [entry.name, entry]))
       const candidates = []
       const seen = new Set()
@@ -825,7 +829,7 @@ export function apply(ctx, rawConfig) {
           `${path}${sep}`,
           `- 你为用户产出的文件（文档、表格、图片、脚本、压缩包等）一律写到上面这个目录，引用时用 \`${settled}${sep}文件名\`；不要在 ${base} 根目录堆积新文件，也不要另建并列的顶层目录。`,
           '- 项目源码、仓库文件照旧留在它们自己的目录里，这条约定只管你新产出的交付文件。',
-          '- 用户发给你的文件也会被复制进这个目录，可以直接用目录里的副本引用。',
+          `- 用户发给你的文件会被${opts.userFileTransfer === 'copy' ? '复制' : '搬'}进这个目录${opts.userFileTransfer === 'copy' ? '' : '（原附件不再留在会话里）'}，直接引用目录里的文件即可。`,
           '- 临时中间文件放系统临时目录，不要留在工作区。',
           '- 结束前如果工作区根目录还有本次新生成的文件，先调用 archive_outputs 把它们归拢进去。',
         ]
@@ -892,11 +896,15 @@ export function apply(ctx, rawConfig) {
               additionalProperties: false,
             },
           },
-          copied: {
+          userFiles: {
             type: 'array',
             items: {
               type: 'object',
-              properties: { from: { type: 'string' }, to: { type: 'string' } },
+              properties: {
+                from: { type: 'string' },
+                to: { type: 'string' },
+                action: { type: 'string', enum: ['move', 'copy'] },
+              },
               required: ['from', 'to'],
               additionalProperties: false,
             },
@@ -916,17 +924,17 @@ export function apply(ctx, rawConfig) {
       },
       render: (args, value) => {
         const moved = Array.isArray(value?.moved) ? value.moved : []
-        const copied = Array.isArray(value?.copied) ? value.copied : []
+        const userFiles = Array.isArray(value?.userFiles) ? value.userFiles : []
         const skipped = Array.isArray(value?.skipped) ? value.skipped : []
         const lines = [`产物目录：${value?.folder ?? ''}`]
-        if (moved.length === 0 && copied.length === 0) lines.push('没有移动或复制任何文件。')
+        if (moved.length === 0 && userFiles.length === 0) lines.push('没有移动或复制任何文件。')
         if (moved.length > 0) {
           lines.push(`已归拢 ${moved.length} 个文件：`)
           for (const entry of moved) lines.push(`- ${entry.from} → ${entry.to}`)
         }
-        if (copied.length > 0) {
-          lines.push(`已复制用户提供的 ${copied.length} 个文件：`)
-          for (const entry of copied) lines.push(`- ${entry.from} → ${entry.to}`)
+        if (userFiles.length > 0) {
+          lines.push(`已处理用户提供的 ${userFiles.length} 个文件：`)
+          for (const entry of userFiles) lines.push(`- ${entry.from} → ${entry.to}（${entry.action === 'copy' ? '复制' : '移动'}）`)
         }
         if (skipped.length > 0) {
           lines.push('未处理：')
@@ -938,10 +946,10 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const agent = exec?.agent
       if (agent === undefined || agent === null) {
-        return { folder: '', moved: [], copied: [], skipped: [{ path: '*', reason: '没有可用的会话上下文' }] }
+        return { folder: '', moved: [], userFiles: [], skipped: [{ path: '*', reason: '没有可用的会话上下文' }] }
       }
       if (!opts.enabled) {
-        return { folder: '', moved: [], copied: [], skipped: [{ path: '*', reason: '插件已停用' }] }
+        return { folder: '', moved: [], userFiles: [], skipped: [{ path: '*', reason: '插件已停用' }] }
       }
       return sweep(agent, { paths: args?.paths, topic: args?.topic })
     },
@@ -1014,7 +1022,7 @@ export function apply(ctx, rawConfig) {
     for (const item of found) {
       const id = String(item.ref?.attachmentId ?? '')
       if (id.length === 0 || recorded.has(id)) continue
-      recorded.set(id, { ...item, copied: false })
+      recorded.set(id, { ...item, done: false })
       if (recorded.size > 50) {
         const oldest = recorded.keys().next().value
         if (oldest !== undefined) recorded.delete(oldest)
